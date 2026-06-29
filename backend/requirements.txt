@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+supabase
+google-generativeai
+pypdf
+python-docx
+python-dotenv
+tiktoken

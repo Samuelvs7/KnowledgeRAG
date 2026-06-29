@@ -1,0 +1,7 @@
+React is a JavaScript library for building user interfaces. It is maintained by Meta (formerly Facebook) and a community of individual developers and companies.
+
+React can be used as a base in the development of single-page, mobile, or server-rendered applications with frameworks like Next.js. However, React is only concerned with state management and rendering that state to the DOM, so creating React applications usually requires the use of additional libraries for routing, as well as certain client-side functionality.
+
+Key features of React include declarative components, unidirectional data flow, and the virtual DOM. The virtual DOM allows React to optimize rendering by calculating the minimal set of DOM changes needed to update the UI efficiently.
+
+React hooks are a relatively new addition that allow functional components to manage state and side-effects, previously only possible in class components. Common hooks include useState, useEffect, and useContext.
