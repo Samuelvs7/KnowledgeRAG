@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
@@ -27,7 +28,10 @@ class Settings(BaseSettings):
     embedding_concurrency: int = 5
     ingestion_concurrency: int = 2
     max_document_bytes: int = 157_286_400
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = Field(
+        default="http://localhost:5173", 
+        description="Comma separated list of allowed origins"
+    )
 
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
@@ -38,6 +42,8 @@ class Settings(BaseSettings):
 
     @property
     def allowed_origins(self) -> list[str]:
+        if self.cors_origins == "*":
+            return ["*"]
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 settings = Settings()
