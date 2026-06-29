@@ -8,7 +8,7 @@ from logging_config import configure_logging
 
 configure_logging()
 
-from routers import documents, products
+from routers import documents, products, sessions, search
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="KnowledgeRAG API",
     description="Backend API for KnowledgeRAG AI Platform",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -33,6 +33,8 @@ app.add_middleware(
 
 app.include_router(documents.router)
 app.include_router(products.router)
+app.include_router(sessions.router)
+app.include_router(search.router)
 
 @app.get("/api/health")
 async def health_check():

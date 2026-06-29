@@ -11,26 +11,26 @@ class DocumentIngestRequest(BaseModel):
 class ContentChunk(BaseModel):
     id: str
     content: str
-    similarity: float
+    similarity: float = 0.0
     source: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
 
 class Diagnostics(BaseModel):
-    embeddingGenerated: bool
-    embeddingModel: str
-    embeddingDimensions: int
-    embeddingTimeMs: int
-    vectorSearchPerformed: bool
-    vectorSearchResults: int
-    vectorSearchTimeMs: int
-    rerankerUsed: bool
-    rerankerTimeMs: int
-    llmPromptTokens: int
-    llmCompletionTokens: int
-    llmTimeMs: int
-    totalTimeMs: int
-    contextChunks: List[ContentChunk]
-    toolCalls: List[Any]
+    embeddingGenerated: bool = False
+    embeddingModel: Optional[str] = None
+    embeddingDimensions: Optional[int] = None
+    embeddingTimeMs: Optional[int] = None
+    vectorSearchPerformed: bool = False
+    vectorSearchResults: int = 0
+    vectorSearchTimeMs: Optional[int] = None
+    rerankerUsed: bool = False
+    rerankerTimeMs: Optional[int] = None
+    llmPromptTokens: Optional[int] = None
+    llmCompletionTokens: Optional[int] = None
+    llmTimeMs: Optional[int] = None
+    totalTimeMs: int = 0
+    contextChunks: List[ContentChunk] = []
+    toolCalls: List[Any] = []
 
 class QueryScope(BaseModel):
     mode: str = "all"
@@ -41,7 +41,9 @@ class QueryRequest(BaseModel):
     query: str
     user_id: Optional[str] = None
     scope: Optional[QueryScope] = None
-    
+    session_id: Optional[str] = None
+
 class QueryResponse(BaseModel):
     answer: str
     diagnostics: Diagnostics
+    session_id: Optional[str] = None

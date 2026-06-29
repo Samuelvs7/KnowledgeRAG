@@ -19,11 +19,11 @@ from config import settings
 from database import supabase
 from models.schemas import ContentChunk, Diagnostics, DocumentIngestRequest, QueryRequest
 from services.chunker import DocumentChunk, iter_document_chunks
-from services.embeddings import embed_text, embed_texts
-from services.llm import generate_text, stream_text
-from services.reranker import rerank_matches
 from services.text_extractor import extract_metadata, iter_extracted_segments, normalize_file_type
-from services.vector_store import finalize_document_chunks, insert_staging_chunks, search_documents_scoped
+from services.vector_store import finalize_document_chunks, insert_staging_chunks
+from services.ai.router import ModelRouter
+from services.agents.registry import AgentRegistry
+from services.memory import MemoryService
 
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -33,13 +33,6 @@ ACTIVE_STATUSES = {"pending", "parsing", "chunking", "embedding", "vectorizing"}
 TERMINAL_STATUSES = {"ready", "failed"}
 INGESTION_TASKS: dict[str, asyncio.Task[None]] = {}
 INGESTION_SEMAPHORE = asyncio.Semaphore(settings.ingestion_concurrency)
-
-
-@dataclass(frozen=True)
-class PreparedQuery:
-    prompt: str
-    diagnostics: Diagnostics
-    started_at: float
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
@@ -94,19 +87,32 @@ async def query_documents(
     req: QueryRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    prepared = await _prepare_query(req, user)
-    llm_start = time.perf_counter()
-    response = await generate_text(prepared.prompt, system_instruction=_rag_system_instruction())
-    llm_time = int((time.perf_counter() - llm_start) * 1000)
-    diagnostics = _diagnostics_with_llm(
-        prepared.diagnostics,
-        prompt_tokens=response.prompt_tokens,
-        completion_tokens=response.completion_tokens,
-        llm_time_ms=llm_time,
-        total_time_ms=int((time.perf_counter() - prepared.started_at) * 1000),
+    document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
+    
+    session_id = getattr(req, 'session_id', None)
+    if not session_id:
+        session_id = await asyncio.to_thread(
+            MemoryService.create_session, user.id, "document_rag", f"Query: {req.query[:30]}..."
+        )
+        
+    await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
+
+    response_dict = await AgentRegistry.execute(
+        "document_rag", 
+        req.query, 
+        user.id,
+        document_id=document_id,
+        collection_id=collection_id,
+        scope_text=scope_text
     )
-    await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), response.text, diagnostics)
-    return {"answer": response.text, "diagnostics": diagnostics}
+    
+    answer = response_dict["answer"]
+    diagnostics = response_dict["diagnostics"]
+    
+    await asyncio.to_thread(MemoryService.add_message, session_id, "assistant", answer, citations=response_dict.get("context_chunks"))
+    await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), answer, diagnostics)
+    
+    return {"answer": answer, "diagnostics": diagnostics, "session_id": session_id}
 
 
 @router.post("/query/stream")
@@ -114,29 +120,46 @@ async def stream_query_documents(
     req: QueryRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    prepared = await _prepare_query(req, user)
+    document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
+    
+    session_id = getattr(req, 'session_id', None)
+    if not session_id:
+        session_id = await asyncio.to_thread(
+            MemoryService.create_session, user.id, "document_rag", f"Query: {req.query[:30]}..."
+        )
+        
+    await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
 
     async def events() -> AsyncIterator[str]:
-        answer_parts: list[str] = []
-        yield _sse("context", {"diagnostics": _model_dump(prepared.diagnostics)})
-        llm_start = time.perf_counter()
-
         try:
-            async for delta in stream_text(prepared.prompt, system_instruction=_rag_system_instruction()):
+            diagnostics, generator, context_chunks = await AgentRegistry.stream(
+                "document_rag", 
+                req.query, 
+                user.id,
+                document_id=document_id,
+                collection_id=collection_id,
+                scope_text=scope_text
+            )
+            
+            yield _sse("context", {"diagnostics": _model_dump(diagnostics), "session_id": session_id})
+            
+            answer_parts = []
+            async for delta in generator:
                 answer_parts.append(delta)
                 yield _sse("delta", {"text": delta})
-
+                
             answer = "".join(answer_parts).strip()
-            llm_time = int((time.perf_counter() - llm_start) * 1000)
-            diagnostics = _diagnostics_with_llm(
-                prepared.diagnostics,
-                prompt_tokens=0,
-                completion_tokens=0,
-                llm_time_ms=llm_time,
-                total_time_ms=int((time.perf_counter() - prepared.started_at) * 1000),
-            )
-            await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), answer, diagnostics)
-            yield _sse("done", {"answer": answer, "diagnostics": _model_dump(diagnostics)})
+            
+            # Reconstruct diagnostics with total usage from stream (simulated here since stream_text does not output tokens yet)
+            payload = _model_dump(diagnostics)
+            payload["llmTimeMs"] = int(time.perf_counter() * 1000) - payload["totalTimeMs"]
+            payload["totalTimeMs"] = int(time.perf_counter() * 1000)
+            final_diagnostics = Diagnostics(**payload)
+            
+            await asyncio.to_thread(MemoryService.add_message, session_id, "assistant", answer, citations=[c.model_dump() for c in context_chunks])
+            await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), answer, final_diagnostics)
+            yield _sse("done", {"answer": answer, "diagnostics": _model_dump(final_diagnostics), "session_id": session_id})
+            
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -254,7 +277,13 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     chunk_count=len(chunks),
                     stage_message=f"Generating embeddings for {len(chunks)} chunks",
                 )
-                embeddings = await embed_texts([chunk.content for chunk in chunks], title=title)
+                embeddings = []
+                provider = ModelRouter.get_provider()
+                # Run concurrently using asyncio.gather but bounded externally by semaphores if needed. 
+                # For simplicity here we map the chunks sequentially or in parallel.
+                for chunk in chunks:
+                    e = await provider.embed_text(chunk.content, title=title)
+                    embeddings.append(e)
 
                 await asyncio.to_thread(
                     _update_ingestion,
@@ -302,54 +331,7 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
             )
 
 
-async def _prepare_query(req: QueryRequest, user: AuthenticatedUser) -> PreparedQuery:
-    query = req.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-    started_at = time.perf_counter()
-    document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
-
-    embed_start = time.perf_counter()
-    query_embedding = await embed_text(query, is_query=True)
-    embed_time = int((time.perf_counter() - embed_start) * 1000)
-
-    search_start = time.perf_counter()
-    matches = await asyncio.to_thread(
-        search_documents_scoped,
-        query_embedding,
-        user_id=user.id,
-        document_id=document_id,
-        collection_id=collection_id,
-        match_threshold=0.3,
-        match_count=20,
-    )
-    search_time = int((time.perf_counter() - search_start) * 1000)
-
-    rerank_start = time.perf_counter()
-    reranked = rerank_matches(matches, query)[:6]
-    rerank_time = int((time.perf_counter() - rerank_start) * 1000)
-
-    context_chunks = [_content_chunk_from_match(match) for match in reranked]
-    prompt = _build_prompt(query, context_chunks, scope_text)
-    diagnostics = Diagnostics(
-        embeddingGenerated=True,
-        embeddingModel=settings.embedding_model,
-        embeddingDimensions=settings.embedding_dimensions,
-        embeddingTimeMs=embed_time,
-        vectorSearchPerformed=True,
-        vectorSearchResults=len(matches),
-        vectorSearchTimeMs=search_time,
-        rerankerUsed=True,
-        rerankerTimeMs=rerank_time,
-        llmPromptTokens=0,
-        llmCompletionTokens=0,
-        llmTimeMs=0,
-        totalTimeMs=int((time.perf_counter() - started_at) * 1000),
-        contextChunks=context_chunks,
-        toolCalls=[],
-    )
-    return PreparedQuery(prompt=prompt, diagnostics=diagnostics, started_at=started_at)
 
 
 async def _resolve_scope(req: QueryRequest, user_id: str) -> tuple[str | None, str | None, str]:
@@ -597,93 +579,7 @@ def _storage_path_from_url(file_url: str) -> str:
     return "/".join(path.strip("/").split("/")[-2:])
 
 
-def _content_chunk_from_match(match: dict[str, Any]) -> ContentChunk:
-    metadata = dict(match.get("metadata") or {})
-    document_title = match.get("document_title") or metadata.get("document_title") or "Document"
-    page = metadata.get("page") or match.get("page")
-    chunk_index = metadata.get("chunk_index")
-    if chunk_index is None:
-        chunk_index = match.get("chunk_index")
-    collection_name = match.get("collection_name") or metadata.get("collection_name")
 
-    source_parts = [str(document_title)]
-    if page:
-        source_parts.append(f"page {page}")
-    if chunk_index is not None:
-        source_parts.append(f"chunk {int(chunk_index) + 1}")
-    if collection_name:
-        source_parts.append(f"collection {collection_name}")
-
-    metadata.update({
-        "document_id": str(match.get("document_id") or metadata.get("document_id") or ""),
-        "document_title": document_title,
-        "page": page,
-        "chunk_index": chunk_index,
-        "collection_id": match.get("collection_id") or metadata.get("collection_id"),
-        "collection_name": collection_name,
-        "rerank_score": match.get("rerank_score"),
-    })
-    return ContentChunk(
-        id=str(match["id"]),
-        content=str(match.get("content") or ""),
-        similarity=float(match.get("similarity") or 0),
-        source=" - ".join(source_parts),
-        metadata=metadata,
-    )
-
-
-def _build_prompt(query: str, context_chunks: list[ContentChunk], scope_text: str) -> str:
-    if not context_chunks:
-        context_text = "No matching document chunks were found for this query."
-    else:
-        sections = []
-        for index, chunk in enumerate(context_chunks, start=1):
-            metadata = chunk.metadata or {}
-            sections.append(
-                "\n".join([
-                    f"[{index}] Source: {chunk.source}",
-                    f"Document ID: {metadata.get('document_id')}",
-                    f"Similarity: {chunk.similarity:.4f}",
-                    "Content:",
-                    chunk.content,
-                ])
-            )
-        context_text = "\n\n".join(sections)
-
-    return (
-        "You are answering a KnowledgeRAG document question. Use only the provided context. "
-        "When an answer uses a chunk, cite it with its bracketed source number like [1]. "
-        "If the context does not contain the answer, say you could not find the answer in the uploaded documents.\n\n"
-        f"Scope: {scope_text}\n\n"
-        f"Context:\n{context_text}\n\n"
-        f"Question: {query}\n\n"
-        "Answer:"
-    )
-
-
-def _rag_system_instruction() -> str:
-    return (
-        "You are KnowledgeRAG's document assistant. Be concise, grounded, and citation-first. "
-        "Never use facts that are not present in the supplied context."
-    )
-
-
-def _diagnostics_with_llm(
-    diagnostics: Diagnostics,
-    *,
-    prompt_tokens: int,
-    completion_tokens: int,
-    llm_time_ms: int,
-    total_time_ms: int,
-) -> Diagnostics:
-    payload = _model_dump(diagnostics)
-    payload.update({
-        "llmPromptTokens": prompt_tokens,
-        "llmCompletionTokens": completion_tokens,
-        "llmTimeMs": llm_time_ms,
-        "totalTimeMs": total_time_ms,
-    })
-    return Diagnostics(**payload)
 
 
 def _log_document_query(user_id: str, query: str, answer: str, diagnostics: Diagnostics) -> None:

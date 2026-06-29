@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     )
     gemini_api_key: str
 
-    embedding_model: str = "gemini-embedding-2"
+    embedding_model: str = "text-embedding-004"
     embedding_dimensions: int = 768
-    llm_model: str = "gemini-3.5-flash"
+    llm_model: str = "gemini-2.0-flash"
     supabase_timeout_seconds: float = 20.0
     storage_timeout_seconds: float = 120.0
     embedding_timeout_seconds: float = 45.0
