@@ -1,141 +1,588 @@
+import asyncio
+import json
+import logging
+import tempfile
 import time
-from urllib.parse import urlparse, unquote
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlparse
 
-from fastapi import APIRouter, HTTPException
-from models.schemas import DocumentIngestRequest, QueryRequest, QueryResponse, Diagnostics, ContentChunk
-from services.text_extractor import extract_text_from_file
-from services.chunker import chunk_text
-from services.embeddings import get_embeddings, get_query_embedding
-from services.vector_store import insert_document_chunks, search_documents
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
+
+from auth import AuthenticatedUser, get_current_user
+from config import settings
 from database import supabase
-import google.generativeai as genai
+from models.schemas import ContentChunk, Diagnostics, DocumentIngestRequest, QueryRequest
+from services.chunker import DocumentChunk, iter_document_chunks
+from services.embeddings import embed_text, embed_texts
+from services.llm import generate_text, stream_text
+from services.reranker import rerank_matches
+from services.text_extractor import extract_metadata, iter_extracted_segments, normalize_file_type
+from services.vector_store import finalize_document_chunks, insert_staging_chunks, search_documents_scoped
+
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+logger = logging.getLogger(__name__)
 
-@router.post("/ingest")
-async def ingest_document(req: DocumentIngestRequest):
-    """
-    Downloads file from Supabase storage, extracts text, chunks it, generates embeddings, 
-    and saves to vector database.
-    """
+ACTIVE_STATUSES = {"pending", "parsing", "chunking", "embedding", "vectorizing"}
+TERMINAL_STATUSES = {"ready", "failed"}
+INGESTION_TASKS: dict[str, asyncio.Task[None]] = {}
+INGESTION_SEMAPHORE = asyncio.Semaphore(settings.ingestion_concurrency)
+
+
+@dataclass(frozen=True)
+class PreparedQuery:
+    prompt: str
+    diagnostics: Diagnostics
+    started_at: float
+
+
+@router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_document(
+    req: DocumentIngestRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    document = await asyncio.to_thread(_get_document_for_user, req.document_id, user.id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    file_path = _validated_storage_path(document.get("file_url"), user.id)
+    existing = await asyncio.to_thread(_get_ingestion_status, req.document_id)
+    existing_status = (existing or {}).get("status")
+
+    if existing_status == "ready" and not req.force:
+        return {"status": "ready", "document_id": req.document_id}
+
+    if existing_status in ACTIVE_STATUSES and not req.force:
+        job_id = str((existing or {}).get("job_id") or uuid.uuid4())
+        if not (existing or {}).get("job_id"):
+            await asyncio.to_thread(
+                _update_ingestion,
+                req.document_id,
+                "pending",
+                job_id=job_id,
+                progress=0,
+                stage_message="Queued for ingestion",
+            )
+        _schedule_ingestion(req.document_id, user.id, job_id)
+        return {"status": "queued", "document_id": req.document_id, "job_id": job_id}
+
+    job_id = str(uuid.uuid4())
+    await asyncio.to_thread(
+        _update_ingestion,
+        req.document_id,
+        "pending",
+        job_id=job_id,
+        progress=0,
+        chunk_count=0,
+        embedding_count=0,
+        error_message=None,
+        stage_message=f"Queued storage object {file_path}",
+        started=True,
+    )
+    _schedule_ingestion(req.document_id, user.id, job_id)
+    return {"status": "queued", "document_id": req.document_id, "job_id": job_id}
+
+
+@router.post("/query")
+async def query_documents(
+    req: QueryRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    prepared = await _prepare_query(req, user)
+    llm_start = time.perf_counter()
+    response = await generate_text(prepared.prompt, system_instruction=_rag_system_instruction())
+    llm_time = int((time.perf_counter() - llm_start) * 1000)
+    diagnostics = _diagnostics_with_llm(
+        prepared.diagnostics,
+        prompt_tokens=response.prompt_tokens,
+        completion_tokens=response.completion_tokens,
+        llm_time_ms=llm_time,
+        total_time_ms=int((time.perf_counter() - prepared.started_at) * 1000),
+    )
+    await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), response.text, diagnostics)
+    return {"answer": response.text, "diagnostics": diagnostics}
+
+
+@router.post("/query/stream")
+async def stream_query_documents(
+    req: QueryRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    prepared = await _prepare_query(req, user)
+
+    async def events() -> AsyncIterator[str]:
+        answer_parts: list[str] = []
+        yield _sse("context", {"diagnostics": _model_dump(prepared.diagnostics)})
+        llm_start = time.perf_counter()
+
+        try:
+            async for delta in stream_text(prepared.prompt, system_instruction=_rag_system_instruction()):
+                answer_parts.append(delta)
+                yield _sse("delta", {"text": delta})
+
+            answer = "".join(answer_parts).strip()
+            llm_time = int((time.perf_counter() - llm_start) * 1000)
+            diagnostics = _diagnostics_with_llm(
+                prepared.diagnostics,
+                prompt_tokens=0,
+                completion_tokens=0,
+                llm_time_ms=llm_time,
+                total_time_ms=int((time.perf_counter() - prepared.started_at) * 1000),
+            )
+            await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), answer, diagnostics)
+            yield _sse("done", {"answer": answer, "diagnostics": _model_dump(diagnostics)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Document query stream failed", extra={"user_id": user.id})
+            yield _sse("error", {"message": str(exc)})
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+async def recover_pending_ingestions() -> None:
     try:
-        _update_ingestion(req.document_id, "parsing", started=True)
+        rows = await asyncio.to_thread(_load_recoverable_ingestions)
+    except Exception:
+        logger.exception("Could not recover pending document ingestion jobs")
+        return
 
-        # Get document record to find file URL/path
-        doc_resp = supabase.table("documents").select("*").eq("id", req.document_id).single().execute()
-        document = doc_resp.data
-        if not document or not document.get("file_url"):
-            raise HTTPException(status_code=404, detail="Document file not found in database")
-            
-        file_path = _storage_path_from_url(document.get("file_url"))
-        res = supabase.storage.from_("documents").download(file_path)
-        
-        text = extract_text_from_file(res, req.file_type)
-        if not text:
-            _update_ingestion(req.document_id, "failed", error_message="No text extracted")
-            return {"status": "error", "message": "No text extracted"}
-            
-        _update_ingestion(req.document_id, "chunking")
-        chunks = chunk_text(text, chunk_size=500, overlap=50)
+    for row in rows:
+        document_id = str(row["document_id"])
+        document = await asyncio.to_thread(_get_document_by_id, document_id)
+        if not document:
+            continue
+        job_id = str(row.get("job_id") or uuid.uuid4())
+        if not row.get("job_id"):
+            await asyncio.to_thread(
+                _update_ingestion,
+                document_id,
+                "pending",
+                job_id=job_id,
+                progress=0,
+                stage_message="Recovered after backend restart",
+            )
+        _schedule_ingestion(document_id, str(document["user_id"]), job_id)
 
-        supabase.table("document_chunks").delete().eq("document_id", req.document_id).execute()
-        
-        _update_ingestion(req.document_id, "embedding", chunk_count=len(chunks))
-        batch_size = 100
-        embedded_count = 0
-        for i in range(0, len(chunks), batch_size):
-            chunk_batch = chunks[i:i+batch_size]
-            embeddings = get_embeddings(chunk_batch)
-            _update_ingestion(req.document_id, "vectorizing", chunk_count=len(chunks), embedding_count=embedded_count + len(embeddings))
-            insert_document_chunks(req.document_id, chunk_batch, embeddings)
-            embedded_count += len(embeddings)
 
-        _update_ingestion(req.document_id, "ready", chunk_count=len(chunks), embedding_count=embedded_count, completed=True)
+def _schedule_ingestion(document_id: str, user_id: str, job_id: str) -> None:
+    current = INGESTION_TASKS.get(document_id)
+    if current and not current.done():
+        return
 
-        return {"status": "success", "chunks": len(chunks)}
-    except Exception as e:
-        print(f"Error during ingestion: {e}")
-        _update_ingestion(req.document_id, "failed", error_message=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+    task = asyncio.create_task(_run_ingestion(document_id, user_id, job_id))
+    INGESTION_TASKS[document_id] = task
+    task.add_done_callback(lambda _: INGESTION_TASKS.pop(document_id, None))
 
-@router.post("/query", response_model=QueryResponse)
-async def query_documents(req: QueryRequest):
-    start_time = time.time()
-    
-    try:
-        # 1. Embed query
-        embed_start = time.time()
-        query_embedding = get_query_embedding(req.query)
-        embed_time = int((time.time() - embed_start) * 1000)
-        
-        search_start = time.time()
-        results = search_documents(query_embedding, match_threshold=0.3, match_count=12)
-        results = _filter_matches_by_scope(results, req)
-        results = results[:4]
-        search_time = int((time.time() - search_start) * 1000)
-        
-        context_chunks = []
-        context_text = ""
-        for i, match in enumerate(results):
-            similarity = match.get("similarity", 0)
-            source = match.get("source") or "Extracted from documents"
-            context_text += f"\nSnippet {i+1}:\n{match['content']}\n"
-            context_chunks.append(ContentChunk(
-                id=match['id'],
-                content=match['content'],
-                similarity=similarity,
-                source=source,
-                metadata=match.get("metadata") or {}
-            ))
-            
-        rerank_start = time.time()
-        # Reranking logic could go here; skipping for Gemini API single-pass
-        rerank_time = int((time.time() - rerank_start) * 1000)
-        
-        # 3. LLM Generation
-        llm_start = time.time()
-        llm = genai.GenerativeModel('gemini-2.0-flash')
-        scope_text = _scope_prompt(req)
-        prompt = f"""You are a highly capable AI assistant for the KnowledgeRAG platform.
-        Answer the user's question based strictly on the following context snippets.
-        If the answer is not contained in the context, say "I could not find the answer in your uploaded documents."
-        Scope: {scope_text}
-        
-        CONTEXT:
-        {context_text}
-        
-        USER QUESTION:
-        {req.query}
-        """
-        response = llm.generate_content(prompt)
-        llm_time = int((time.time() - llm_start) * 1000)
-        
-        # Build Diagnostics
-        total_time = int((time.time() - start_time) * 1000)
-        diagnostics = Diagnostics(
-            embeddingGenerated=True,
-            embeddingModel="text-embedding-004",
-            embeddingDimensions=768,
-            embeddingTimeMs=embed_time,
-            vectorSearchPerformed=True,
-            vectorSearchResults=len(results),
-            vectorSearchTimeMs=search_time,
-            rerankerUsed=False,
-            rerankerTimeMs=rerank_time,
-            llmPromptTokens=getattr(response.usage_metadata, 'prompt_token_count', 0) if hasattr(response, 'usage_metadata') else 0,
-            llmCompletionTokens=getattr(response.usage_metadata, 'candidates_token_count', 0) if hasattr(response, 'usage_metadata') else 0,
-            llmTimeMs=llm_time,
-            totalTimeMs=total_time,
-            contextChunks=context_chunks,
-            toolCalls=[]
+
+async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
+    async with INGESTION_SEMAPHORE:
+        try:
+            document = await asyncio.to_thread(_get_document_for_user, document_id, user_id)
+            if not document:
+                await asyncio.to_thread(
+                    _update_ingestion,
+                    document_id,
+                    "failed",
+                    error_message="Document no longer exists or is not owned by the user",
+                    completed=True,
+                )
+                return
+
+            file_path = _validated_storage_path(document.get("file_url"), user_id)
+            file_type = normalize_file_type(str(document.get("file_type") or ""), file_path)
+            title = str(document.get("title") or Path(file_path).name)
+            await asyncio.to_thread(_increment_ingestion_attempt, document_id)
+
+            await asyncio.to_thread(
+                _update_ingestion,
+                document_id,
+                "parsing",
+                job_id=job_id,
+                progress=10,
+                stage_message="Downloading document from Supabase Storage",
+                started=True,
+            )
+
+            with tempfile.TemporaryDirectory(prefix="knowledgerag-") as temp_dir:
+                local_path = await _download_storage_object(file_path, temp_dir)
+                metadata = await asyncio.to_thread(extract_metadata, local_path, file_type)
+                await asyncio.to_thread(_update_document_metadata, document_id, metadata)
+
+                await asyncio.to_thread(
+                    _update_ingestion,
+                    document_id,
+                    "chunking",
+                    job_id=job_id,
+                    progress=25,
+                    stage_message="Extracting and chunking text",
+                )
+                collection_ids = await asyncio.to_thread(_collection_ids_for_document, document_id, user_id)
+                chunks = await asyncio.to_thread(
+                    _build_chunks,
+                    local_path,
+                    file_type,
+                    document_id,
+                    title,
+                    file_path,
+                    collection_ids,
+                )
+                if not chunks:
+                    await asyncio.to_thread(
+                        _update_ingestion,
+                        document_id,
+                        "failed",
+                        job_id=job_id,
+                        progress=100,
+                        error_message="No text could be extracted from the document",
+                        completed=True,
+                    )
+                    return
+
+                await asyncio.to_thread(
+                    _update_ingestion,
+                    document_id,
+                    "embedding",
+                    job_id=job_id,
+                    progress=45,
+                    chunk_count=len(chunks),
+                    stage_message=f"Generating embeddings for {len(chunks)} chunks",
+                )
+                embeddings = await embed_texts([chunk.content for chunk in chunks], title=title)
+
+                await asyncio.to_thread(
+                    _update_ingestion,
+                    document_id,
+                    "vectorizing",
+                    job_id=job_id,
+                    progress=80,
+                    chunk_count=len(chunks),
+                    embedding_count=len(embeddings),
+                    stage_message="Replacing document vectors atomically",
+                )
+                inserted_count = await asyncio.to_thread(_replace_document_chunks, job_id, document_id, chunks, embeddings)
+
+            await asyncio.to_thread(
+                _update_ingestion,
+                document_id,
+                "ready",
+                job_id=job_id,
+                progress=100,
+                chunk_count=inserted_count,
+                embedding_count=inserted_count,
+                stage_message="Document indexed and ready",
+                completed=True,
+            )
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                _update_ingestion,
+                document_id,
+                "pending",
+                job_id=job_id,
+                stage_message="Ingestion interrupted and will be retried on restart",
+            )
+            raise
+        except Exception as exc:
+            logger.exception("Document ingestion failed", extra={"document_id": document_id, "job_id": job_id})
+            await asyncio.to_thread(_cleanup_staging, document_id, job_id)
+            await asyncio.to_thread(
+                _update_ingestion,
+                document_id,
+                "failed",
+                job_id=job_id,
+                progress=100,
+                error_message=str(exc),
+                completed=True,
+            )
+
+
+async def _prepare_query(req: QueryRequest, user: AuthenticatedUser) -> PreparedQuery:
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    started_at = time.perf_counter()
+    document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
+
+    embed_start = time.perf_counter()
+    query_embedding = await embed_text(query, is_query=True)
+    embed_time = int((time.perf_counter() - embed_start) * 1000)
+
+    search_start = time.perf_counter()
+    matches = await asyncio.to_thread(
+        search_documents_scoped,
+        query_embedding,
+        user_id=user.id,
+        document_id=document_id,
+        collection_id=collection_id,
+        match_threshold=0.3,
+        match_count=20,
+    )
+    search_time = int((time.perf_counter() - search_start) * 1000)
+
+    rerank_start = time.perf_counter()
+    reranked = rerank_matches(matches, query)[:6]
+    rerank_time = int((time.perf_counter() - rerank_start) * 1000)
+
+    context_chunks = [_content_chunk_from_match(match) for match in reranked]
+    prompt = _build_prompt(query, context_chunks, scope_text)
+    diagnostics = Diagnostics(
+        embeddingGenerated=True,
+        embeddingModel=settings.embedding_model,
+        embeddingDimensions=settings.embedding_dimensions,
+        embeddingTimeMs=embed_time,
+        vectorSearchPerformed=True,
+        vectorSearchResults=len(matches),
+        vectorSearchTimeMs=search_time,
+        rerankerUsed=True,
+        rerankerTimeMs=rerank_time,
+        llmPromptTokens=0,
+        llmCompletionTokens=0,
+        llmTimeMs=0,
+        totalTimeMs=int((time.perf_counter() - started_at) * 1000),
+        contextChunks=context_chunks,
+        toolCalls=[],
+    )
+    return PreparedQuery(prompt=prompt, diagnostics=diagnostics, started_at=started_at)
+
+
+async def _resolve_scope(req: QueryRequest, user_id: str) -> tuple[str | None, str | None, str]:
+    scope = req.scope
+    if not scope or scope.mode == "all":
+        return None, None, "all indexed documents owned by the authenticated user"
+
+    if scope.mode == "document":
+        if not scope.document_id:
+            raise HTTPException(status_code=400, detail="Document scope requires document_id")
+        document = await asyncio.to_thread(_get_document_for_user, scope.document_id, user_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document scope is not accessible")
+        return scope.document_id, None, f"document: {document.get('title') or scope.document_id}"
+
+    if scope.mode == "collection":
+        if not scope.collection_id:
+            raise HTTPException(status_code=400, detail="Collection scope requires collection_id")
+        collection = await asyncio.to_thread(_get_collection_for_user, scope.collection_id, user_id)
+        if not collection:
+            raise HTTPException(status_code=404, detail="Collection scope is not accessible")
+        return None, scope.collection_id, f"collection: {collection.get('name') or scope.collection_id}"
+
+    raise HTTPException(status_code=400, detail=f"Unsupported query scope: {scope.mode}")
+
+
+async def _download_storage_object(file_path: str, temp_dir: str) -> Path:
+    signed = await asyncio.to_thread(
+        lambda: supabase.storage.from_("documents").create_signed_url(file_path, 300)
+    )
+    signed_url = signed.get("signedURL") or signed.get("signedUrl")
+    if not signed_url:
+        raise RuntimeError("Could not create a signed URL for the document")
+
+    suffix = Path(file_path).suffix or ".bin"
+    local_path = Path(temp_dir) / f"{uuid.uuid4()}{suffix}"
+    timeout = httpx.Timeout(
+        settings.storage_timeout_seconds,
+        connect=10.0,
+        read=settings.storage_timeout_seconds,
+        write=10.0,
+    )
+    total = 0
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream("GET", signed_url) as response:
+            response.raise_for_status()
+            content_length = int(response.headers.get("content-length") or 0)
+            if content_length > settings.max_document_bytes:
+                raise ValueError("Document exceeds the configured file size limit")
+
+            with local_path.open("wb") as handle:
+                async for chunk in response.aiter_bytes(1024 * 1024):
+                    total += len(chunk)
+                    if total > settings.max_document_bytes:
+                        raise ValueError("Document exceeds the configured file size limit")
+                    handle.write(chunk)
+    return local_path
+
+
+def _build_chunks(
+    local_path: Path,
+    file_type: str,
+    document_id: str,
+    title: str,
+    source_path: str,
+    collection_ids: list[str],
+) -> list[DocumentChunk]:
+    return list(
+        iter_document_chunks(
+            iter_extracted_segments(local_path, file_type),
+            document_id=document_id,
+            title=title,
+            source_path=source_path,
+            collection_ids=collection_ids,
+            chunk_size=500,
+            overlap=50,
         )
+    )
 
-        _log_document_query(req, response.text, diagnostics)
-        
-        return QueryResponse(answer=response.text, diagnostics=diagnostics)
-    except Exception as e:
-        print(f"Error querying: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+def _replace_document_chunks(
+    job_id: str,
+    document_id: str,
+    chunks: list[DocumentChunk],
+    embeddings: list[list[float]],
+) -> int:
+    if len(chunks) != len(embeddings):
+        raise ValueError("Chunk and embedding counts do not match")
+    _cleanup_staging(document_id, job_id)
+    insert_staging_chunks(job_id, document_id, chunks, embeddings)
+    return finalize_document_chunks(document_id, job_id)
+
+
+def _get_document_for_user(document_id: str, user_id: str) -> dict[str, Any] | None:
+    response = (
+        supabase.table("documents")
+        .select("*")
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def _get_document_by_id(document_id: str) -> dict[str, Any] | None:
+    response = supabase.table("documents").select("*").eq("id", document_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def _get_collection_for_user(collection_id: str, user_id: str) -> dict[str, Any] | None:
+    response = (
+        supabase.table("document_collections")
+        .select("*")
+        .eq("id", collection_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def _get_ingestion_status(document_id: str) -> dict[str, Any] | None:
+    response = supabase.table("document_ingestion").select("*").eq("document_id", document_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def _load_recoverable_ingestions() -> list[dict[str, Any]]:
+    response = supabase.table("document_ingestion").select("*").in_("status", list(ACTIVE_STATUSES)).execute()
+    return response.data or []
+
+
+def _collection_ids_for_document(document_id: str, user_id: str) -> list[str]:
+    links = (
+        supabase.table("collection_documents")
+        .select("collection_id")
+        .eq("document_id", document_id)
+        .execute()
+        .data
+        or []
+    )
+    collection_ids = [str(link["collection_id"]) for link in links if link.get("collection_id")]
+    if not collection_ids:
+        return []
+
+    collections = (
+        supabase.table("document_collections")
+        .select("id")
+        .eq("user_id", user_id)
+        .in_("id", collection_ids)
+        .execute()
+        .data
+        or []
+    )
+    return [str(collection["id"]) for collection in collections]
+
+
+def _update_document_metadata(document_id: str, metadata: dict[str, Any]) -> None:
+    supabase.table("documents").update({
+        "metadata": metadata,
+        "updated_at": _utc_now(),
+    }).eq("id", document_id).execute()
+
+
+def _update_ingestion(
+    document_id: str,
+    status_value: str,
+    *,
+    job_id: str | None = None,
+    progress: int | None = None,
+    chunk_count: int | None = None,
+    embedding_count: int | None = None,
+    error_message: str | None = None,
+    stage_message: str | None = None,
+    started: bool = False,
+    completed: bool = False,
+) -> None:
+    payload: dict[str, Any] = {
+        "document_id": document_id,
+        "status": status_value,
+        "updated_at": _utc_now(),
+    }
+    if job_id is not None:
+        payload["job_id"] = job_id
+    if progress is not None:
+        payload["progress"] = progress
+    if chunk_count is not None:
+        payload["chunk_count"] = chunk_count
+    if embedding_count is not None:
+        payload["embedding_count"] = embedding_count
+    if error_message is not None or status_value != "failed":
+        payload["error_message"] = error_message
+    if stage_message is not None:
+        payload["stage_message"] = stage_message
+    if started:
+        payload["started_at"] = _utc_now()
+        payload["completed_at"] = None
+    if completed or status_value in TERMINAL_STATUSES:
+        payload["completed_at"] = _utc_now()
+
+    supabase.table("document_ingestion").upsert(payload, on_conflict="document_id").execute()
+
+
+def _increment_ingestion_attempt(document_id: str) -> None:
+    row = _get_ingestion_status(document_id) or {}
+    attempt_count = int(row.get("attempt_count") or 0) + 1
+    supabase.table("document_ingestion").update({
+        "attempt_count": attempt_count,
+        "updated_at": _utc_now(),
+    }).eq("document_id", document_id).execute()
+
+
+def _cleanup_staging(document_id: str, job_id: str) -> None:
+    try:
+        supabase.table("document_chunk_staging").delete().eq("document_id", document_id).eq("job_id", job_id).execute()
+    except Exception:
+        logger.warning("Could not clean document chunk staging rows", extra={"document_id": document_id, "job_id": job_id})
+
+
+def _validated_storage_path(file_url: str | None, user_id: str) -> str:
+    if not file_url:
+        raise HTTPException(status_code=404, detail="Document has no storage path")
+
+    file_path = _storage_path_from_url(file_url).strip("/")
+    if not file_path or file_path.startswith("../") or "/../" in f"/{file_path}/":
+        raise HTTPException(status_code=400, detail="Invalid document storage path")
+    if not file_path.startswith(f"{user_id}/"):
+        raise HTTPException(status_code=403, detail="Document storage path does not belong to the authenticated user")
+    return file_path
 
 
 def _storage_path_from_url(file_url: str) -> str:
@@ -150,118 +597,102 @@ def _storage_path_from_url(file_url: str) -> str:
     return "/".join(path.strip("/").split("/")[-2:])
 
 
-def _update_ingestion(
-    document_id: str,
-    status: str,
+def _content_chunk_from_match(match: dict[str, Any]) -> ContentChunk:
+    metadata = dict(match.get("metadata") or {})
+    document_title = match.get("document_title") or metadata.get("document_title") or "Document"
+    page = metadata.get("page") or match.get("page")
+    chunk_index = metadata.get("chunk_index")
+    if chunk_index is None:
+        chunk_index = match.get("chunk_index")
+    collection_name = match.get("collection_name") or metadata.get("collection_name")
+
+    source_parts = [str(document_title)]
+    if page:
+        source_parts.append(f"page {page}")
+    if chunk_index is not None:
+        source_parts.append(f"chunk {int(chunk_index) + 1}")
+    if collection_name:
+        source_parts.append(f"collection {collection_name}")
+
+    metadata.update({
+        "document_id": str(match.get("document_id") or metadata.get("document_id") or ""),
+        "document_title": document_title,
+        "page": page,
+        "chunk_index": chunk_index,
+        "collection_id": match.get("collection_id") or metadata.get("collection_id"),
+        "collection_name": collection_name,
+        "rerank_score": match.get("rerank_score"),
+    })
+    return ContentChunk(
+        id=str(match["id"]),
+        content=str(match.get("content") or ""),
+        similarity=float(match.get("similarity") or 0),
+        source=" - ".join(source_parts),
+        metadata=metadata,
+    )
+
+
+def _build_prompt(query: str, context_chunks: list[ContentChunk], scope_text: str) -> str:
+    if not context_chunks:
+        context_text = "No matching document chunks were found for this query."
+    else:
+        sections = []
+        for index, chunk in enumerate(context_chunks, start=1):
+            metadata = chunk.metadata or {}
+            sections.append(
+                "\n".join([
+                    f"[{index}] Source: {chunk.source}",
+                    f"Document ID: {metadata.get('document_id')}",
+                    f"Similarity: {chunk.similarity:.4f}",
+                    "Content:",
+                    chunk.content,
+                ])
+            )
+        context_text = "\n\n".join(sections)
+
+    return (
+        "You are answering a KnowledgeRAG document question. Use only the provided context. "
+        "When an answer uses a chunk, cite it with its bracketed source number like [1]. "
+        "If the context does not contain the answer, say you could not find the answer in the uploaded documents.\n\n"
+        f"Scope: {scope_text}\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question: {query}\n\n"
+        "Answer:"
+    )
+
+
+def _rag_system_instruction() -> str:
+    return (
+        "You are KnowledgeRAG's document assistant. Be concise, grounded, and citation-first. "
+        "Never use facts that are not present in the supplied context."
+    )
+
+
+def _diagnostics_with_llm(
+    diagnostics: Diagnostics,
     *,
-    chunk_count: int | None = None,
-    embedding_count: int | None = None,
-    error_message: str | None = None,
-    started: bool = False,
-    completed: bool = False,
-) -> None:
-    payload = {
-        "document_id": document_id,
-        "status": status,
-    }
-    if chunk_count is not None:
-        payload["chunk_count"] = chunk_count
-    if embedding_count is not None:
-        payload["embedding_count"] = embedding_count
-    if error_message is not None:
-        payload["error_message"] = error_message
-    if started:
-        payload["started_at"] = _utc_now()
-    if completed or status in {"ready", "failed"}:
-        payload["completed_at"] = _utc_now()
-
-    try:
-        supabase.table("document_ingestion").upsert(payload, on_conflict="document_id").execute()
-    except Exception as exc:
-        print(f"Could not update ingestion status: {exc}")
+    prompt_tokens: int,
+    completion_tokens: int,
+    llm_time_ms: int,
+    total_time_ms: int,
+) -> Diagnostics:
+    payload = _model_dump(diagnostics)
+    payload.update({
+        "llmPromptTokens": prompt_tokens,
+        "llmCompletionTokens": completion_tokens,
+        "llmTimeMs": llm_time_ms,
+        "totalTimeMs": total_time_ms,
+    })
+    return Diagnostics(**payload)
 
 
-def _filter_matches_by_scope(matches: list[dict], req: QueryRequest) -> list[dict]:
-    if not matches:
-        return []
-
-    ids = [match["id"] for match in matches if match.get("id")]
-    if not ids:
-        return matches
-
-    allowed_document_ids = _allowed_document_ids(req)
-
-    try:
-        chunk_resp = supabase.table("document_chunks").select("id,document_id,chunk_index").in_("id", ids).execute()
-        chunks = {chunk["id"]: chunk for chunk in (chunk_resp.data or [])}
-        doc_ids = list({chunk["document_id"] for chunk in chunks.values()})
-        if not doc_ids:
-            return []
-
-        doc_resp = supabase.table("documents").select("id,title,user_id").in_("id", doc_ids).execute()
-        docs = {doc["id"]: doc for doc in (doc_resp.data or [])}
-    except Exception as exc:
-        print(f"Could not hydrate document matches: {exc}")
-        return matches
-
-    filtered = []
-    for match in matches:
-        chunk = chunks.get(match.get("id"))
-        if not chunk:
-            continue
-        doc = docs.get(chunk["document_id"])
-        if not doc or doc.get("user_id") != req.user_id:
-            continue
-        if allowed_document_ids is not None and chunk["document_id"] not in allowed_document_ids:
-            continue
-
-        enriched = dict(match)
-        enriched["source"] = f"{doc.get('title', 'Document')} - chunk {int(chunk.get('chunk_index') or 0) + 1}"
-        enriched["metadata"] = {
-            "document_id": chunk["document_id"],
-            "document_title": doc.get("title"),
-            "chunk_index": chunk.get("chunk_index"),
-        }
-        filtered.append(enriched)
-
-    return filtered
-
-
-def _allowed_document_ids(req: QueryRequest) -> set[str] | None:
-    if not req.scope or req.scope.mode == "all":
-        return None
-
-    if req.scope.mode == "document" and req.scope.document_id:
-        return {req.scope.document_id}
-
-    if req.scope.mode == "collection" and req.scope.collection_id:
-        try:
-            response = supabase.table("collection_documents").select("document_id").eq("collection_id", req.scope.collection_id).execute()
-            return {row["document_id"] for row in (response.data or [])}
-        except Exception as exc:
-            print(f"Could not load collection scope: {exc}")
-            return set()
-
-    return None
-
-
-def _scope_prompt(req: QueryRequest) -> str:
-    if not req.scope or req.scope.mode == "all":
-        return "all indexed documents"
-    if req.scope.mode == "document":
-        return f"single document {req.scope.document_id or 'not selected'}"
-    if req.scope.mode == "collection":
-        return f"collection {req.scope.collection_id or 'not selected'}"
-    return req.scope.mode
-
-
-def _log_document_query(req: QueryRequest, answer: str, diagnostics: Diagnostics) -> None:
-    payload = diagnostics.model_dump() if hasattr(diagnostics, "model_dump") else diagnostics.dict()
+def _log_document_query(user_id: str, query: str, answer: str, diagnostics: Diagnostics) -> None:
+    payload = _model_dump(diagnostics)
     try:
         supabase.table("ai_queries").insert({
-            "user_id": req.user_id,
+            "user_id": user_id,
             "query_type": "document",
-            "query_text": req.query,
+            "query_text": query,
             "context_chunks": payload["contextChunks"],
             "tool_calls": payload["toolCalls"],
             "embedding_generated": payload["embeddingGenerated"],
@@ -272,15 +703,27 @@ def _log_document_query(req: QueryRequest, answer: str, diagnostics: Diagnostics
             "confidence_score": _confidence_from_chunks(payload["contextChunks"]),
             "status": "completed",
         }).execute()
-    except Exception as exc:
-        print(f"Could not log document query: {exc}")
+    except Exception:
+        logger.warning("Could not log document query", extra={"user_id": user_id})
 
 
-def _confidence_from_chunks(chunks: list[dict]) -> float:
+def _confidence_from_chunks(chunks: list[dict[str, Any]]) -> float:
     if not chunks:
         return 0.0
     average = sum(float(chunk.get("similarity", 0)) for chunk in chunks) / len(chunks)
     return round(max(0.0, min(0.99, average)), 2)
+
+
+def _model_dump(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    if hasattr(model, "dict"):
+        return model.dict()
+    return dict(model)
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
 def _utc_now() -> str:

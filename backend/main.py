@@ -1,23 +1,31 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
-from config import settings
 
-# Configure Gemini
-genai.configure(api_key=settings.gemini_api_key)
+from config import settings
+from logging_config import configure_logging
+
+configure_logging()
 
 from routers import documents, products
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await documents.recover_pending_ingestions()
+    yield
 
 app = FastAPI(
     title="KnowledgeRAG API",
     description="Backend API for KnowledgeRAG AI Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,7 +36,12 @@ app.include_router(products.router)
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "online", "model": "gemini-2.0-flash"}
+    return {
+        "status": "online",
+        "model": settings.llm_model,
+        "embedding_model": settings.embedding_model,
+        "embedding_dimensions": settings.embedding_dimensions,
+    }
 
 if __name__ == "__main__":
     import uvicorn

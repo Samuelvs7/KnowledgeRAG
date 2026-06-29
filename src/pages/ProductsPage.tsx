@@ -39,7 +39,7 @@ interface DashboardStats {
 }
 
 export function ProductsPage() {
-  const { user } = useAuth();
+  const { user, session } = useAuth();
   const [activeView, setActiveView] = useState<'dashboard' | 'chat' | 'products' | 'orders' | 'alerts'>('dashboard');
   const [products, setProducts] = useState<Product[]>([]);
   const [alerts, setAlerts] = useState<InventoryAlert[]>([]);
@@ -98,6 +98,16 @@ export function ProductsPage() {
     }
   };
 
+  const authorizedJsonHeaders = () => {
+    if (!session?.access_token) {
+      throw new Error('Your session has expired. Please sign in again.');
+    }
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+    };
+  };
+
   const handleQuerySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!query.trim() || processing || !user) return;
@@ -120,8 +130,8 @@ export function ProductsPage() {
       const apiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
       const res = await fetch(`${apiBaseUrl}/api/products/query`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, user_id: user.id }),
+        headers: authorizedJsonHeaders(),
+        body: JSON.stringify({ query }),
       });
 
       const data = await res.json();

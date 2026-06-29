@@ -15,6 +15,7 @@ export interface Document {
   file_type: string;
   file_size: number | null;
   file_url: string | null;
+  metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -51,10 +52,15 @@ export interface DocumentIngestion {
   status: 'pending' | 'parsing' | 'chunking' | 'embedding' | 'vectorizing' | 'ready' | 'failed';
   chunk_count: number;
   embedding_count: number;
+  progress?: number;
+  stage_message?: string | null;
+  attempt_count?: number;
+  job_id?: string | null;
   error_message: string | null;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  updated_at?: string | null;
 }
 
 export interface Product {

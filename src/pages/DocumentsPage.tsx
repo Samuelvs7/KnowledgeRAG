@@ -54,6 +54,8 @@ interface Message {
 interface BackendHealth {
   status: string;
   model: string;
+  embedding_model?: string;
+  embedding_dimensions?: number;
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -75,8 +77,10 @@ const FILE_TYPE_LABELS: Record<string, string> = {
   'text/csv': 'CSV',
 };
 
+const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
 export function DocumentsPage() {
-  const { user } = useAuth();
+  const { user, session } = useAuth();
   const [activeView, setActiveView] = useState<DocumentView>('dashboard');
   const [documents, setDocuments] = useState<Document[]>([]);
   const [collections, setCollections] = useState<DocumentCollection[]>([]);
@@ -107,6 +111,7 @@ export function DocumentsPage() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const queryAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (user) {
@@ -121,6 +126,10 @@ export function DocumentsPage() {
       chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
     }
   }, [messages, activeView]);
+
+  useEffect(() => () => {
+    queryAbortRef.current?.abort();
+  }, []);
 
   const documentsById = useMemo(() => new Map(documents.map(doc => [doc.id, doc])), [documents]);
 
@@ -245,20 +254,50 @@ export function DocumentsPage() {
     }
   };
 
+  const authorizedJsonHeaders = () => {
+    if (!session?.access_token) {
+      throw new Error('Your session has expired. Please sign in again.');
+    }
+    return {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+    };
+  };
+
+  const refreshIngestionStatus = async (documentId: string) => {
+    const { data, error: statusError } = await supabase
+      .from('document_ingestion')
+      .select('*')
+      .eq('document_id', documentId)
+      .limit(1);
+
+    if (statusError) throw statusError;
+    const status = (data?.[0] || null) as DocumentIngestion | null;
+    if (status) {
+      setIngestionStatus(prev => ({ ...prev, [documentId]: status }));
+    }
+    return status;
+  };
+
+  const pollIngestionStatus = async (documentId: string) => {
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      await wait(2000);
+      const status = await refreshIngestionStatus(documentId);
+      if (status && ['ready', 'failed'].includes(status.status)) {
+        return status;
+      }
+    }
+    return null;
+  };
+
   const runIngestion = async (doc: Document) => {
     try {
-      await supabase.from('document_ingestion').upsert({
-        document_id: doc.id,
-        status: 'parsing',
-        started_at: new Date().toISOString(),
-      }, { onConflict: 'document_id' });
-
       setIngestionStatus(prev => ({
         ...prev,
         [doc.id]: {
           ...(prev[doc.id] || {}),
           document_id: doc.id,
-          status: 'parsing',
+          status: 'pending',
           chunk_count: prev[doc.id]?.chunk_count || 0,
           embedding_count: prev[doc.id]?.embedding_count || 0,
         } as DocumentIngestion,
@@ -266,10 +305,9 @@ export function DocumentsPage() {
 
       const response = await fetch(`${API_BASE_URL}/api/documents/ingest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authorizedJsonHeaders(),
         body: JSON.stringify({
           document_id: doc.id,
-          user_id: user?.id,
           title: doc.title,
           file_type: doc.file_type,
         }),
@@ -280,31 +318,11 @@ export function DocumentsPage() {
         throw new Error(data.message || data.detail || 'Document ingestion failed.');
       }
 
-      const updateData: Partial<DocumentIngestion> = {
-        status: 'ready',
-        chunk_count: data.chunks,
-        embedding_count: data.chunks,
-        completed_at: new Date().toISOString(),
-      };
-
-      await supabase.from('document_ingestion').update(updateData).eq('document_id', doc.id);
-
-      setIngestionStatus(prev => ({
-        ...prev,
-        [doc.id]: {
-          ...prev[doc.id],
-          ...updateData,
-        } as DocumentIngestion,
-      }));
+      await pollIngestionStatus(doc.id);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Document ingestion failed.';
       console.error('Ingestion error:', err);
       setError(message);
-      await supabase.from('document_ingestion').update({
-        status: 'failed',
-        error_message: message,
-        completed_at: new Date().toISOString(),
-      }).eq('document_id', doc.id);
       setIngestionStatus(prev => ({
         ...prev,
         [doc.id]: {
@@ -329,25 +347,34 @@ export function DocumentsPage() {
       const createdDocuments = await Promise.all(files.map(async file => {
         const fileExt = file.name.split('.').pop()?.toLowerCase() || 'txt';
         const storagePath = `${user.id}/${Date.now()}_${crypto.randomUUID()}.${fileExt}`;
+        let uploadedPath: string | null = null;
 
-        const { error: uploadError } = await supabase.storage.from('documents').upload(storagePath, file);
-        if (uploadError) throw uploadError;
+        try {
+          const { error: uploadError } = await supabase.storage.from('documents').upload(storagePath, file);
+          if (uploadError) throw uploadError;
+          uploadedPath = storagePath;
 
-        const { data: doc, error: insertError } = await supabase
-          .from('documents')
-          .insert({
-            user_id: user.id,
-            title: file.name,
-            description: `Uploaded on ${new Date().toLocaleDateString()}`,
-            file_type: file.type || fileExt,
-            file_size: file.size,
-            file_url: storagePath,
-          })
-          .select()
-          .single();
+          const { data: doc, error: insertError } = await supabase
+            .from('documents')
+            .insert({
+              user_id: user.id,
+              title: file.name,
+              description: `Uploaded on ${new Date().toLocaleDateString()}`,
+              file_type: file.type || fileExt,
+              file_size: file.size,
+              file_url: storagePath,
+            })
+            .select()
+            .single();
 
-        if (insertError) throw insertError;
-        return doc as Document;
+          if (insertError) throw insertError;
+          return doc as Document;
+        } catch (err) {
+          if (uploadedPath) {
+            await supabase.storage.from('documents').remove([uploadedPath]);
+          }
+          throw err;
+        }
       }));
 
       setDocuments(prev => [...createdDocuments, ...prev]);
@@ -471,8 +498,14 @@ export function DocumentsPage() {
       content: query.trim(),
       createdAt: new Date().toISOString(),
     };
+    const assistantMessageId = crypto.randomUUID();
 
-    setMessages(prev => [...prev, userMessage]);
+    setMessages(prev => [...prev, userMessage, {
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      createdAt: new Date().toISOString(),
+    }]);
     setQuery('');
     setProcessing(true);
     setDiagnostics(null);
@@ -480,12 +513,15 @@ export function DocumentsPage() {
     const startTime = Date.now();
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/documents/query`, {
+      queryAbortRef.current?.abort();
+      const controller = new AbortController();
+      queryAbortRef.current = controller;
+      const response = await fetch(`${API_BASE_URL}/api/documents/query/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authorizedJsonHeaders(),
+        signal: controller.signal,
         body: JSON.stringify({
           query: userMessage.content,
-          user_id: user.id,
           scope: {
             mode: aiMode,
             document_id: aiMode === 'document' ? modeDocumentId || selectedDocument?.id : null,
@@ -494,20 +530,68 @@ export function DocumentsPage() {
         }),
       });
 
-      const data = await response.json();
       if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
         throw new Error(data.detail || 'Document query failed.');
       }
+      if (!response.body) {
+        throw new Error('Document query stream is unavailable.');
+      }
 
-      const nextDiagnostics = data.diagnostics as AIDiagnostics;
-      setDiagnostics(nextDiagnostics);
-      setMessages(prev => [...prev, {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content: data.answer,
-        citations: nextDiagnostics.contextChunks,
-        createdAt: new Date().toISOString(),
-      }]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let assistantContent = '';
+      let finalCitations: ContextChunk[] = [];
+
+      const updateAssistantMessage = (content: string, citations?: ContextChunk[]) => {
+        setMessages(prev => prev.map(message => (
+          message.id === assistantMessageId
+            ? { ...message, content, citations: citations ?? message.citations }
+            : message
+        )));
+      };
+
+      const handleStreamEvent = (rawEvent: string) => {
+        const lines = rawEvent.split(/\r?\n/);
+        const eventName = lines.find(line => line.startsWith('event:'))?.slice(6).trim() || 'message';
+        const dataText = lines
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).trimStart())
+          .join('\n');
+
+        if (!dataText) return;
+        const payload = JSON.parse(dataText);
+        if (eventName === 'context') {
+          const nextDiagnostics = payload.diagnostics as AIDiagnostics;
+          finalCitations = nextDiagnostics.contextChunks || [];
+          setDiagnostics(nextDiagnostics);
+          updateAssistantMessage(assistantContent, finalCitations);
+        } else if (eventName === 'delta') {
+          assistantContent += payload.text || '';
+          updateAssistantMessage(assistantContent, finalCitations);
+        } else if (eventName === 'done') {
+          const nextDiagnostics = payload.diagnostics as AIDiagnostics;
+          finalCitations = nextDiagnostics.contextChunks || finalCitations;
+          assistantContent = payload.answer || assistantContent;
+          setDiagnostics(nextDiagnostics);
+          updateAssistantMessage(assistantContent, finalCitations);
+        } else if (eventName === 'error') {
+          throw new Error(payload.message || 'Document query stream failed.');
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+        events.forEach(handleStreamEvent);
+      }
+      if (buffer.trim()) {
+        handleStreamEvent(buffer);
+      }
       void fetchData();
     } catch (err) {
       console.error('Query error:', err);
@@ -528,13 +612,13 @@ export function DocumentsPage() {
         contextChunks: [],
         toolCalls: [],
       });
-      setMessages(prev => [...prev, {
-        id: crypto.randomUUID(),
-        role: 'assistant',
-        content: 'I could not complete the document query. Check the backend logs and try again.',
-        createdAt: new Date().toISOString(),
-      }]);
+      setMessages(prev => prev.map(message => (
+        message.id === assistantMessageId
+          ? { ...message, content: 'I could not complete the document query. Check the backend logs and try again.' }
+          : message
+      )));
     } finally {
+      queryAbortRef.current = null;
       setProcessing(false);
     }
   };
@@ -978,7 +1062,7 @@ export function DocumentsPage() {
                 ['Embeddings', ingestion?.embedding_count || 0],
                 ['Vector Store', ingestion?.status === 'ready' ? 'Ready' : 'Pending'],
                 ['Indexed Time', ingestion?.completed_at ? shortDate(ingestion.completed_at) : '--'],
-                ['Model Used', 'text-embedding-004'],
+                ['Model Used', diagnostics?.embeddingModel || health?.embedding_model || 'Unknown'],
                 ['Size', formatBytes(selectedDocument.file_size || 0)],
               ].map(([label, value]) => (
                 <div key={label} className="rounded-lg border border-slate-800 bg-slate-900 p-3">
@@ -1141,7 +1225,7 @@ export function DocumentsPage() {
             {[
               ['LLM Provider', 'Google Gemini'],
               ['Active Model', health?.model || 'Unknown'],
-              ['Embedding Model', 'text-embedding-004'],
+              ['Embedding Model', health?.embedding_model || diagnostics?.embeddingModel || 'Unknown'],
               ['Vector Store', 'Supabase pgvector'],
               ['Chunking', 'tiktoken overlapping chunks'],
               ['Supported Parsers', 'PDF, DOCX, TXT, Markdown, CSV'],

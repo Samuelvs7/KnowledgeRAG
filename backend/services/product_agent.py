@@ -3,14 +3,14 @@ import re
 import time
 from typing import Any
 
-import google.generativeai as genai
-
+from config import settings
 from database import supabase
 from services.embeddings import get_embeddings, get_query_embedding
+from services.llm import generate_text_sync
 
 
-EMBEDDING_MODEL_NAME = "text-embedding-004"
-LLM_MODEL_NAME = "gemini-2.0-flash"
+EMBEDDING_MODEL_NAME = settings.embedding_model
+LLM_MODEL_NAME = settings.llm_model
 
 
 def run_inventory_agent(query: str, user_id: str) -> dict[str, Any]:
@@ -483,13 +483,12 @@ def _generate_answer(query: str, tool_calls: list[dict[str, Any]]) -> tuple[str,
     )
 
     try:
-        response = genai.GenerativeModel(LLM_MODEL_NAME).generate_content(prompt)
-        answer = (response.text or "").strip()
-        usage = getattr(response, "usage_metadata", None)
-        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
-        completion_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
-        if answer:
-            return answer, prompt_tokens, completion_tokens
+        response = generate_text_sync(
+            prompt,
+            system_instruction="You are KnowledgeRAG's inventory AI agent. Use only verified tool output.",
+        )
+        if response.text:
+            return response.text, response.prompt_tokens, response.completion_tokens
     except Exception:
         pass
 

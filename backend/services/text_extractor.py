@@ -1,53 +1,182 @@
 import io
+import os
 import zipfile
-from pypdf import PdfReader
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
 import docx
+from pypdf import PdfReader
+
+
+@dataclass(frozen=True)
+class ExtractedSegment:
+    text: str
+    page: int | None = None
+    section: str | None = None
+
+
+def normalize_file_type(file_type: str, path: str | Path | None = None) -> str:
+    value = (file_type or "").lower().split(";", 1)[0].strip()
+    suffix = Path(path).suffix.lower() if path else ""
+    if value in {"application/pdf", "pdf"} or suffix == ".pdf":
+        return "pdf"
+    if value in {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"} or suffix == ".docx":
+        return "docx"
+    if value in {"application/zip", "application/x-zip-compressed", "zip"} or suffix == ".zip":
+        return "zip"
+    return "text"
+
+
+def extract_metadata(path: str | Path, file_type: str) -> dict[str, Any]:
+    file_path = Path(path)
+    kind = normalize_file_type(file_type, file_path)
+    metadata: dict[str, Any] = {
+        "title": file_path.stem,
+        "author": None,
+        "page_count": None,
+        "file_name": file_path.name,
+        "file_size": file_path.stat().st_size,
+        "format": kind,
+    }
+
+    if kind == "pdf":
+        reader = PdfReader(str(file_path))
+        pdf_meta = reader.metadata or {}
+        metadata.update({
+            "title": _clean_metadata_value(getattr(pdf_meta, "title", None)) or file_path.stem,
+            "author": _clean_metadata_value(getattr(pdf_meta, "author", None)),
+            "subject": _clean_metadata_value(getattr(pdf_meta, "subject", None)),
+            "creator": _clean_metadata_value(getattr(pdf_meta, "creator", None)),
+            "producer": _clean_metadata_value(getattr(pdf_meta, "producer", None)),
+            "creation_date": str(getattr(pdf_meta, "creation_date", "") or "") or None,
+            "page_count": len(reader.pages),
+        })
+    elif kind == "docx":
+        document = docx.Document(str(file_path))
+        props = document.core_properties
+        metadata.update({
+            "title": props.title or file_path.stem,
+            "author": props.author or None,
+            "subject": props.subject or None,
+            "keywords": props.keywords or None,
+            "created": props.created.isoformat() if props.created else None,
+            "modified": props.modified.isoformat() if props.modified else None,
+            "section_count": len(document.sections),
+        })
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def iter_extracted_segments(path: str | Path, file_type: str) -> Iterator[ExtractedSegment]:
+    file_path = Path(path)
+    kind = normalize_file_type(file_type, file_path)
+    if kind == "pdf":
+        yield from _iter_pdf(file_path)
+    elif kind == "docx":
+        yield from _iter_docx(file_path)
+    elif kind == "zip":
+        yield from _iter_zip(file_path)
+    else:
+        yield from _iter_text(file_path)
+
+
+def _iter_pdf(path: Path) -> Iterator[ExtractedSegment]:
+    reader = PdfReader(str(path))
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            yield ExtractedSegment(text=text, page=page_number, section=f"Page {page_number}")
+
+
+def _iter_docx(path: Path) -> Iterator[ExtractedSegment]:
+    document = docx.Document(str(path))
+    current_section: str | None = None
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        style_name = (paragraph.style.name if paragraph.style else "").lower()
+        if style_name.startswith("heading"):
+            current_section = text
+        yield ExtractedSegment(text=text, section=current_section)
+
+    for table_index, table in enumerate(document.tables, start=1):
+        for row in table.rows:
+            text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if text:
+                yield ExtractedSegment(text=text, section=f"Table {table_index}")
+
+
+def _iter_text(path: Path) -> Iterator[ExtractedSegment]:
+    section: str | None = None
+    buffer: list[str] = []
+    size = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                section = stripped.lstrip("#").strip() or section
+            buffer.append(line)
+            size += len(line)
+            if size >= 64 * 1024:
+                text = "".join(buffer).strip()
+                if text:
+                    yield ExtractedSegment(text=text, section=section)
+                buffer = []
+                size = 0
+    text = "".join(buffer).strip()
+    if text:
+        yield ExtractedSegment(text=text, section=section)
+
+
+def _iter_zip(path: Path) -> Iterator[ExtractedSegment]:
+    supported = (".txt", ".md", ".markdown", ".csv")
+    total_uncompressed = 0
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(supported):
+                continue
+            total_uncompressed += info.file_size
+            if total_uncompressed > 200 * 1024 * 1024:
+                raise ValueError("Archive expands beyond the 200 MB safety limit")
+            with archive.open(info) as member:
+                wrapper = io.TextIOWrapper(member, encoding="utf-8", errors="replace")
+                buffer: list[str] = []
+                size = 0
+                for line in wrapper:
+                    buffer.append(line)
+                    size += len(line)
+                    if size >= 64 * 1024:
+                        text = "".join(buffer).strip()
+                        if text:
+                            yield ExtractedSegment(text=text, section=info.filename)
+                        buffer = []
+                        size = 0
+                text = "".join(buffer).strip()
+                if text:
+                    yield ExtractedSegment(text=text, section=info.filename)
+
 
 def extract_text_from_file(file_bytes: bytes, file_type: str) -> str:
-    """Extract plain text from supported document formats."""
-    text = ""
-    file_stream = io.BytesIO(file_bytes)
-    normalized_type = (file_type or "").lower()
-    
-    if normalized_type in {"pdf", "application/pdf"} or normalized_type.endswith("/pdf"):
-        reader = PdfReader(file_stream)
-        for page in reader.pages:
-             extracted = page.extract_text()
-             if extracted:
-                 text += extracted + "\n"
-    elif normalized_type in {
-        "docx",
-        "doc",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
-    }:
-        doc = docx.Document(file_stream)
-        for para in doc.paragraphs:
-            if para.text:
-                text += para.text + "\n"
-    elif normalized_type in {"zip", "application/zip", "application/x-zip-compressed"}:
-        text = _extract_supported_zip_text(file_stream)
-    else:
-        try:
-            text = file_stream.read().decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-            
-    return text.strip()
+    """Compatibility helper for callers that still provide in-memory bytes."""
+    suffix = {"pdf": ".pdf", "docx": ".docx", "zip": ".zip"}.get(normalize_file_type(file_type), ".txt")
+    import tempfile
 
-def _extract_supported_zip_text(file_stream: io.BytesIO) -> str:
-    supported_extensions = (".txt", ".md", ".markdown", ".csv")
-    collected: list[str] = []
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            handle.write(file_bytes)
+            path = handle.name
+        return "\n".join(segment.text for segment in iter_extracted_segments(path, file_type)).strip()
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
-    with zipfile.ZipFile(file_stream) as archive:
-        for name in archive.namelist():
-            if name.endswith("/") or not name.lower().endswith(supported_extensions):
-                continue
-            with archive.open(name) as member:
-                try:
-                    content = member.read().decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
-                collected.append(f"\n--- {name} ---\n{content}")
 
-    return "\n".join(collected)
+def _clean_metadata_value(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
