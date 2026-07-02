@@ -1,8 +1,11 @@
 import asyncio
+import logging
 import queue
 import threading
 import time
+import traceback
 from collections.abc import AsyncIterator
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 from google import genai
@@ -12,9 +15,36 @@ from config import settings
 from services.ai.providers.base import BaseProvider, LLMResult
 from services.retry import is_transient_error, with_retry
 
+logger = logging.getLogger(__name__)
+
+
+def _package_version(package_name: str) -> str:
+    try:
+        return version(package_name)
+    except PackageNotFoundError:
+        return "not-installed"
+
+
 class GeminiProvider(BaseProvider):
     def __init__(self):
-        self.client = genai.Client(api_key=settings.gemini_api_key)
+        logger.info("[STEP] gemini.initialization")
+        logger.info(
+            "[START] Initializing Gemini client llm_model=%s embedding_model=%s embedding_dimensions=%s",
+            settings.llm_model,
+            settings.embedding_model,
+            settings.embedding_dimensions,
+        )
+        try:
+            self.client = genai.Client(api_key=settings.gemini_api_key)
+        except Exception:
+            logger.exception("[FAILED] Gemini client initialization failed")
+            traceback.print_exc()
+            raise
+        logger.info(
+            "[SUCCESS] Gemini client initialized sdk_version=%s package_version=%s",
+            getattr(genai, "__version__", "unknown"),
+            _package_version("google-genai"),
+        )
 
     async def generate_text(self, prompt: str, *, system_instruction: str | None = None) -> LLMResult:
         async def operation() -> Any:
@@ -54,14 +84,32 @@ class GeminiProvider(BaseProvider):
                 break
 
     async def embed_text(self, text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
+        logger.info(
+            "[STEP] gemini.embedding text_chars=%s title_present=%s is_query=%s",
+            len(text or ""),
+            bool(title),
+            is_query,
+        )
+        logger.info(
+            "[START] Generating Gemini embedding model=%s dimensions=%s",
+            settings.embedding_model,
+            settings.embedding_dimensions,
+        )
         async def operation() -> list[float]:
             return await asyncio.to_thread(self._embed_text_sync, text, title, is_query)
 
-        return await with_retry(
-            operation,
-            attempts=settings.max_retry_attempts,
-            timeout_seconds=settings.embedding_timeout_seconds,
-        )
+        try:
+            embedding = await with_retry(
+                operation,
+                attempts=settings.max_retry_attempts,
+                timeout_seconds=settings.embedding_timeout_seconds,
+            )
+        except Exception:
+            logger.exception("[FAILED] Gemini embedding generation failed")
+            traceback.print_exc()
+            raise
+        logger.info("[SUCCESS] Gemini embedding generated length=%s", len(embedding))
+        return embedding
 
     def _generate_content(self, prompt: str, system_instruction: str | None) -> Any:
         config = types.GenerateContentConfig(
@@ -134,16 +182,33 @@ class GeminiProvider(BaseProvider):
 
     def _embed_text_sync(self, text: str, title: str | None, is_query: bool) -> list[float]:
         prepared = self._prepare_embedding_text(text, title=title, is_query=is_query)
-        result = self.client.models.embed_content(
-            model=settings.embedding_model,
-            contents=prepared,
-            config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+        logger.info(
+            "[START] Calling Gemini embed_content model=%s dimensions=%s prepared_chars=%s",
+            settings.embedding_model,
+            settings.embedding_dimensions,
+            len(prepared),
         )
+        try:
+            result = self.client.models.embed_content(
+                model=settings.embedding_model,
+                contents=prepared,
+                config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+            )
+        except Exception:
+            logger.exception("[FAILED] Gemini embed_content call failed")
+            traceback.print_exc()
+            raise
         embedding = self._extract_embedding_values(result)
         if len(embedding) != settings.embedding_dimensions:
+            logger.error(
+                "[FAILED] Embedding dimension mismatch expected=%s got=%s",
+                settings.embedding_dimensions,
+                len(embedding),
+            )
             raise ValueError(
                 f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, got {len(embedding)}"
             )
+        logger.info("[SUCCESS] Gemini embed_content returned embedding_length=%s", len(embedding))
         return embedding
 
     def _prepare_embedding_text(self, text: str, *, title: str | None, is_query: bool) -> str:

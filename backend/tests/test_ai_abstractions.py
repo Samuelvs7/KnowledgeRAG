@@ -2,6 +2,7 @@ import pytest
 import asyncio
 from services.ai.router import ModelRouter
 from services.agents.registry import AgentRegistry
+from services.plugin_manager import PluginManager
 
 @pytest.mark.asyncio
 async def test_model_router_returns_provider():
@@ -12,6 +13,7 @@ async def test_model_router_returns_provider():
     assert hasattr(provider, "embed_text")
 
 def test_agent_registry_loads_agents():
+    PluginManager.discover_plugins()
     agent = AgentRegistry.get_agent("document_rag")
     assert agent is not None
     assert hasattr(agent, "execute")

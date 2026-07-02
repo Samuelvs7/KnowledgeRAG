@@ -1,0 +1,7 @@
+﻿DB insert error object:
+{
+  "code": "PGRST205",
+  "details": null,
+  "hint": null,
+  "message": "Could not find the table 'public.documents' in the schema cache"
+}

@@ -2,13 +2,22 @@ import time
 from typing import Any
 from models.schemas import Diagnostics, ContentChunk
 from services.agents.base import BaseAgent
+from services.agents.registry import AgentRegistry
 from services.ai.router import ModelRouter
 from services.retrieval.document_retriever import DocumentRetriever
 from services.citations import CitationService
 from services.reranker import rerank_matches
 from config import settings
 
+@AgentRegistry.register("document_rag")
 class DocumentRAGAgent(BaseAgent):
+    name = "Document AI"
+    description = "Intelligent assistant for analyzing and questioning documents."
+    supported_scopes = ["all", "document", "collection"]
+    supported_tools = ["search_documents"]
+    supported_models = ["gemini-2.0-flash", "claude-3-5-sonnet", "gpt-4o", "mock"]
+    agent_type = "document_rag"
+
     def __init__(self):
         self.retriever = DocumentRetriever()
         self.provider = ModelRouter.get_provider()

@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import time
+import traceback
 from typing import Any
 
 from google import genai
@@ -9,18 +11,37 @@ from config import settings
 from services.retry import is_transient_error, with_retry
 
 
-client = genai.Client(api_key=settings.gemini_api_key)
+logger = logging.getLogger(__name__)
+
+logger.info("[STEP] embeddings.gemini_client")
+logger.info("[START] Initializing shared Gemini embedding client")
+try:
+    client = genai.Client(api_key=settings.gemini_api_key)
+except Exception:
+    logger.exception("[FAILED] Shared Gemini embedding client initialization failed")
+    traceback.print_exc()
+    raise
+logger.info("[SUCCESS] Shared Gemini embedding client initialized")
 
 
 async def embed_text(text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
     async def operation() -> list[float]:
         return await asyncio.to_thread(_embed_text_sync, text, title, is_query)
 
-    return await with_retry(
-        operation,
-        attempts=settings.max_retry_attempts,
-        timeout_seconds=settings.embedding_timeout_seconds,
-    )
+    logger.info("[STEP] embeddings.embed_text text_chars=%s is_query=%s", len(text or ""), is_query)
+    logger.info("[START] Shared embedding generation model=%s dimensions=%s", settings.embedding_model, settings.embedding_dimensions)
+    try:
+        embedding = await with_retry(
+            operation,
+            attempts=settings.max_retry_attempts,
+            timeout_seconds=settings.embedding_timeout_seconds,
+        )
+    except Exception:
+        logger.exception("[FAILED] Shared embedding generation failed")
+        traceback.print_exc()
+        raise
+    logger.info("[SUCCESS] Shared embedding generated length=%s", len(embedding))
+    return embedding
 
 
 async def embed_texts(texts: list[str], *, title: str | None = None) -> list[list[float]]:
@@ -56,16 +77,33 @@ def _embed_with_sync_retry(text: str, title: str | None, is_query: bool) -> list
 
 def _embed_text_sync(text: str, title: str | None, is_query: bool) -> list[float]:
     prepared = _prepare_embedding_text(text, title=title, is_query=is_query)
-    result = client.models.embed_content(
-        model=settings.embedding_model,
-        contents=prepared,
-        config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+    logger.info(
+        "[START] Calling shared Gemini embed_content model=%s dimensions=%s prepared_chars=%s",
+        settings.embedding_model,
+        settings.embedding_dimensions,
+        len(prepared),
     )
+    try:
+        result = client.models.embed_content(
+            model=settings.embedding_model,
+            contents=prepared,
+            config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+        )
+    except Exception:
+        logger.exception("[FAILED] Shared Gemini embed_content call failed")
+        traceback.print_exc()
+        raise
     embedding = _extract_embedding_values(result)
     if len(embedding) != settings.embedding_dimensions:
+        logger.error(
+            "[FAILED] Shared embedding dimension mismatch expected=%s got=%s",
+            settings.embedding_dimensions,
+            len(embedding),
+        )
         raise ValueError(
             f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, got {len(embedding)}"
         )
+    logger.info("[SUCCESS] Shared Gemini embed_content returned embedding_length=%s", len(embedding))
     return embedding
 
 

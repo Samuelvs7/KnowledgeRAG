@@ -3,6 +3,7 @@ import json
 import logging
 import tempfile
 import time
+import traceback
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -40,20 +41,30 @@ async def ingest_document(
     req: DocumentIngestRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
+    logger.info("[UPLOAD] Ingestion request received document_id=%s user_id=%s", req.document_id, user.id)
+    logger.info("[STEP] documents.ingest_endpoint document_id=%s user_id=%s", req.document_id, user.id)
+    logger.info("[START] Loading document record for ingestion")
     document = await asyncio.to_thread(_get_document_for_user, req.document_id, user.id)
     if not document:
+        logger.error("[FAILED] Document not found for ingestion document_id=%s user_id=%s", req.document_id, user.id)
         raise HTTPException(status_code=404, detail="Document not found")
+    logger.info("[SUCCESS] Document record loaded for ingestion document_id=%s", req.document_id)
 
     file_path = _validated_storage_path(document.get("file_url"), user.id)
+    logger.info("[SUCCESS] Storage path validated document_id=%s file_path=%s", req.document_id, file_path)
+    logger.info("[START] Loading existing ingestion status document_id=%s", req.document_id)
     existing = await asyncio.to_thread(_get_ingestion_status, req.document_id)
     existing_status = (existing or {}).get("status")
+    logger.info("[SUCCESS] Existing ingestion status document_id=%s status=%s", req.document_id, existing_status)
 
     if existing_status == "ready" and not req.force:
+        logger.info("[SUCCESS] Ingestion already ready document_id=%s", req.document_id)
         return {"status": "ready", "document_id": req.document_id}
 
     if existing_status in ACTIVE_STATUSES and not req.force:
         job_id = str((existing or {}).get("job_id") or uuid.uuid4())
         if not (existing or {}).get("job_id"):
+            logger.info("[START] Updating active ingestion with generated job_id document_id=%s job_id=%s", req.document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
                 req.document_id,
@@ -62,10 +73,14 @@ async def ingest_document(
                 progress=0,
                 stage_message="Queued for ingestion",
             )
+            logger.info("[SUCCESS] Active ingestion job_id persisted document_id=%s job_id=%s", req.document_id, job_id)
         _schedule_ingestion(req.document_id, user.id, job_id)
+        logger.info("[BACKGROUND START] Ingestion task scheduled document_id=%s job_id=%s", req.document_id, job_id)
+        logger.info("[SUCCESS] Ingestion queued from active status document_id=%s job_id=%s", req.document_id, job_id)
         return {"status": "queued", "document_id": req.document_id, "job_id": job_id}
 
     job_id = str(uuid.uuid4())
+    logger.info("[START] Creating pending ingestion row document_id=%s job_id=%s", req.document_id, job_id)
     await asyncio.to_thread(
         _update_ingestion,
         req.document_id,
@@ -78,7 +93,10 @@ async def ingest_document(
         stage_message=f"Queued storage object {file_path}",
         started=True,
     )
+    logger.info("[SUCCESS] Pending ingestion row created document_id=%s job_id=%s", req.document_id, job_id)
     _schedule_ingestion(req.document_id, user.id, job_id)
+    logger.info("[BACKGROUND START] Ingestion task scheduled document_id=%s job_id=%s", req.document_id, job_id)
+    logger.info("[SUCCESS] Ingestion queued document_id=%s job_id=%s", req.document_id, job_id)
     return {"status": "queued", "document_id": req.document_id, "job_id": job_id}
 
 
@@ -170,19 +188,25 @@ async def stream_query_documents(
 
 
 async def recover_pending_ingestions() -> None:
+    logger.info("[STEP] documents.recover_pending_ingestions")
+    logger.info("[START] Loading recoverable ingestion jobs")
     try:
         rows = await asyncio.to_thread(_load_recoverable_ingestions)
     except Exception:
-        logger.exception("Could not recover pending document ingestion jobs")
+        logger.exception("[FAILED] Could not recover pending document ingestion jobs")
         return
+    logger.info("[SUCCESS] Loaded recoverable ingestion jobs count=%s", len(rows))
 
     for row in rows:
         document_id = str(row["document_id"])
+        logger.info("[START] Recovering ingestion document_id=%s", document_id)
         document = await asyncio.to_thread(_get_document_by_id, document_id)
         if not document:
+            logger.warning("[FAILED] Recoverable ingestion document no longer exists document_id=%s", document_id)
             continue
         job_id = str(row.get("job_id") or uuid.uuid4())
         if not row.get("job_id"):
+            logger.info("[START] Persisting recovered job_id document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
                 document_id,
@@ -191,24 +215,37 @@ async def recover_pending_ingestions() -> None:
                 progress=0,
                 stage_message="Recovered after backend restart",
             )
+            logger.info("[SUCCESS] Recovered job_id persisted document_id=%s job_id=%s", document_id, job_id)
         _schedule_ingestion(document_id, str(document["user_id"]), job_id)
+        logger.info("[SUCCESS] Recoverable ingestion scheduled document_id=%s job_id=%s", document_id, job_id)
 
 
 def _schedule_ingestion(document_id: str, user_id: str, job_id: str) -> None:
+    logger.info("[BACKGROUND START] Scheduling ingestion task document_id=%s job_id=%s user_id=%s", document_id, job_id, user_id)
+    logger.info("[STEP] documents.schedule_ingestion document_id=%s job_id=%s user_id=%s", document_id, job_id, user_id)
     current = INGESTION_TASKS.get(document_id)
     if current and not current.done():
+        logger.info("[SUCCESS] Existing background ingestion task already running document_id=%s job_id=%s", document_id, job_id)
         return
 
+    logger.info("[START] Creating background ingestion task document_id=%s job_id=%s", document_id, job_id)
     task = asyncio.create_task(_run_ingestion(document_id, user_id, job_id))
     INGESTION_TASKS[document_id] = task
     task.add_done_callback(lambda _: INGESTION_TASKS.pop(document_id, None))
+    logger.info("[SUCCESS] Background ingestion task created document_id=%s job_id=%s", document_id, job_id)
 
 
 async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
+    logger.info("[BACKGROUND START] Worker started document_id=%s job_id=%s user_id=%s", document_id, job_id, user_id)
+    logger.info("[STEP] documents.run_ingestion document_id=%s job_id=%s user_id=%s", document_id, job_id, user_id)
+    logger.info("[START] Waiting for ingestion semaphore document_id=%s job_id=%s", document_id, job_id)
     async with INGESTION_SEMAPHORE:
+        logger.info("[SUCCESS] Ingestion semaphore acquired document_id=%s job_id=%s", document_id, job_id)
         try:
+            logger.info("[START] Loading document inside background task document_id=%s job_id=%s", document_id, job_id)
             document = await asyncio.to_thread(_get_document_for_user, document_id, user_id)
             if not document:
+                logger.error("[FAILED] Background ingestion document missing document_id=%s job_id=%s", document_id, job_id)
                 await asyncio.to_thread(
                     _update_ingestion,
                     document_id,
@@ -217,36 +254,65 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     completed=True,
                 )
                 return
+            logger.info("[SUCCESS] Background ingestion document loaded document_id=%s job_id=%s", document_id, job_id)
 
             file_path = _validated_storage_path(document.get("file_url"), user_id)
             file_type = normalize_file_type(str(document.get("file_type") or ""), file_path)
             title = str(document.get("title") or Path(file_path).name)
+            logger.info(
+                "[SUCCESS] Ingestion input resolved document_id=%s job_id=%s file_path=%s file_type=%s title=%s",
+                document_id,
+                job_id,
+                file_path,
+                file_type,
+                title,
+            )
+            logger.info("[START] Incrementing ingestion attempt document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(_increment_ingestion_attempt, document_id)
+            logger.info("[SUCCESS] Ingestion attempt incremented document_id=%s job_id=%s", document_id, job_id)
 
+            logger.info("[READING] Updating status and preparing storage read document_id=%s job_id=%s", document_id, job_id)
+            logger.info("[START] Updating ingestion status parsing document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
                 document_id,
                 "parsing",
                 job_id=job_id,
                 progress=10,
-                stage_message="Downloading document from Supabase Storage",
+                stage_message="Reading file",
                 started=True,
             )
+            logger.info("[SUCCESS] Ingestion status parsing document_id=%s job_id=%s", document_id, job_id)
 
             with tempfile.TemporaryDirectory(prefix="knowledgerag-") as temp_dir:
+                logger.info("[READING] Downloading source file document_id=%s job_id=%s file_path=%s", document_id, job_id, file_path)
+                logger.info("[START] Downloading storage object document_id=%s job_id=%s file_path=%s", document_id, job_id, file_path)
                 local_path = await _download_storage_object(file_path, temp_dir)
+                logger.info("[SUCCESS] Storage object downloaded document_id=%s job_id=%s local_path=%s", document_id, job_id, local_path)
+                logger.info("[TEXT EXTRACTION] Reading metadata document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[START] Extracting document metadata document_id=%s job_id=%s", document_id, job_id)
                 metadata = await asyncio.to_thread(extract_metadata, local_path, file_type)
+                logger.info("[SUCCESS] Metadata extracted document_id=%s job_id=%s keys=%s", document_id, job_id, sorted(metadata.keys()))
+                logger.info("[START] Updating document metadata document_id=%s job_id=%s", document_id, job_id)
                 await asyncio.to_thread(_update_document_metadata, document_id, metadata)
+                logger.info("[SUCCESS] Document metadata updated document_id=%s job_id=%s", document_id, job_id)
 
+                logger.info("[TEXT EXTRACTION] Updating status before text extraction document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[START] Updating ingestion status chunking document_id=%s job_id=%s", document_id, job_id)
                 await asyncio.to_thread(
                     _update_ingestion,
                     document_id,
                     "chunking",
                     job_id=job_id,
                     progress=25,
-                    stage_message="Extracting and chunking text",
+                    stage_message="Extracting text",
                 )
+                logger.info("[SUCCESS] Ingestion status chunking document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[START] Loading collection ids document_id=%s job_id=%s", document_id, job_id)
                 collection_ids = await asyncio.to_thread(_collection_ids_for_document, document_id, user_id)
+                logger.info("[SUCCESS] Collection ids loaded document_id=%s job_id=%s count=%s", document_id, job_id, len(collection_ids))
+                logger.info("[CHUNKING] Building semantic chunks document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[START] Building semantic chunks document_id=%s job_id=%s", document_id, job_id)
                 chunks = await asyncio.to_thread(
                     _build_chunks,
                     local_path,
@@ -256,7 +322,9 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     file_path,
                     collection_ids,
                 )
+                logger.info("[SUCCESS] Semantic chunks built document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
                 if not chunks:
+                    logger.error("[FAILED] No chunks extracted document_id=%s job_id=%s", document_id, job_id)
                     await asyncio.to_thread(
                         _update_ingestion,
                         document_id,
@@ -268,6 +336,8 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     )
                     return
 
+                logger.info("[EMBEDDING] Updating status before embedding document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
+                logger.info("[START] Updating ingestion status embedding document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
                 await asyncio.to_thread(
                     _update_ingestion,
                     document_id,
@@ -277,14 +347,26 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     chunk_count=len(chunks),
                     stage_message=f"Generating embeddings for {len(chunks)} chunks",
                 )
+                logger.info("[SUCCESS] Ingestion status embedding document_id=%s job_id=%s", document_id, job_id)
                 embeddings = []
+                logger.info("[START] Selecting provider for embedding document_id=%s job_id=%s", document_id, job_id)
                 provider = ModelRouter.get_provider()
-                # Run concurrently using asyncio.gather but bounded externally by semaphores if needed. 
-                # For simplicity here we map the chunks sequentially or in parallel.
-                for chunk in chunks:
-                    e = await provider.embed_text(chunk.content, title=title)
-                    embeddings.append(e)
+                logger.info("[SUCCESS] Provider selected for embedding provider=%s document_id=%s job_id=%s", provider.__class__.__name__, document_id, job_id)
+                logger.info("[EMBEDDING] Generating embeddings document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
+                logger.info(f"[STEP] Starting embedding generation for {len(chunks)} chunks using provider {provider.__class__.__name__}...")
+                for i, chunk in enumerate(chunks, 1):
+                    logger.info(f"[START] Embedding chunk {i}/{len(chunks)} document_id={document_id} job_id={job_id}")
+                    try:
+                        e = await provider.embed_text(chunk.content, title=title)
+                        embeddings.append(e)
+                        logger.info(f"[SUCCESS] Embedding chunk {i}/{len(chunks)} length={len(e)} document_id={document_id} job_id={job_id}")
+                    except Exception as exc:
+                        logger.exception(f"[FAILED] Embedding chunk {i}/{len(chunks)} document_id={document_id} job_id={job_id}")
+                        traceback.print_exc()
+                        raise
 
+                logger.info("[SAVING] Updating status before vector save document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
+                logger.info("[START] Updating ingestion status vectorizing document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
                 await asyncio.to_thread(
                     _update_ingestion,
                     document_id,
@@ -293,10 +375,16 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     progress=80,
                     chunk_count=len(chunks),
                     embedding_count=len(embeddings),
-                    stage_message="Replacing document vectors atomically",
+                    stage_message="Saving vector database",
                 )
+                logger.info("[SUCCESS] Ingestion status vectorizing document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[SAVING] Replacing document chunks document_id=%s job_id=%s", document_id, job_id)
+                logger.info("[START] Replacing document chunks document_id=%s job_id=%s", document_id, job_id)
                 inserted_count = await asyncio.to_thread(_replace_document_chunks, job_id, document_id, chunks, embeddings)
+                logger.info("[SUCCESS] Document chunks replaced document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)
 
+            logger.info("[READY] Updating final ready status document_id=%s job_id=%s", document_id, job_id)
+            logger.info("[START] Updating ingestion status ready document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
                 document_id,
@@ -308,7 +396,9 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 stage_message="Document indexed and ready",
                 completed=True,
             )
+            logger.info("[SUCCESS] Document ingestion ready document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)
         except asyncio.CancelledError:
+            logger.warning("[FAILED] Document ingestion task cancelled document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
                 document_id,
@@ -318,7 +408,8 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
             )
             raise
         except Exception as exc:
-            logger.exception("Document ingestion failed", extra={"document_id": document_id, "job_id": job_id})
+            logger.exception("[FAILED] Document ingestion failed", extra={"document_id": document_id, "job_id": job_id})
+            traceback.print_exc()
             await asyncio.to_thread(_cleanup_staging, document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,
@@ -359,12 +450,16 @@ async def _resolve_scope(req: QueryRequest, user_id: str) -> tuple[str | None, s
 
 
 async def _download_storage_object(file_path: str, temp_dir: str) -> Path:
+    logger.info("[STEP] documents.download_storage_object file_path=%s", file_path)
+    logger.info("[START] Creating Supabase Storage signed URL file_path=%s", file_path)
     signed = await asyncio.to_thread(
         lambda: supabase.storage.from_("documents").create_signed_url(file_path, 300)
     )
     signed_url = signed.get("signedURL") or signed.get("signedUrl")
     if not signed_url:
+        logger.error("[FAILED] Supabase Storage signed URL missing file_path=%s", file_path)
         raise RuntimeError("Could not create a signed URL for the document")
+    logger.info("[SUCCESS] Supabase Storage signed URL created file_path=%s", file_path)
 
     suffix = Path(file_path).suffix or ".bin"
     local_path = Path(temp_dir) / f"{uuid.uuid4()}{suffix}"
@@ -375,6 +470,7 @@ async def _download_storage_object(file_path: str, temp_dir: str) -> Path:
         write=10.0,
     )
     total = 0
+    logger.info("[START] Downloading signed storage URL file_path=%s", file_path)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         async with client.stream("GET", signed_url) as response:
             response.raise_for_status()
@@ -388,6 +484,7 @@ async def _download_storage_object(file_path: str, temp_dir: str) -> Path:
                     if total > settings.max_document_bytes:
                         raise ValueError("Document exceeds the configured file size limit")
                     handle.write(chunk)
+    logger.info("[SUCCESS] Downloaded storage object file_path=%s bytes=%s local_path=%s", file_path, total, local_path)
     return local_path
 
 
@@ -399,6 +496,7 @@ def _build_chunks(
     source_path: str,
     collection_ids: list[str],
 ) -> list[DocumentChunk]:
+    logger.info("[STEP] documents.build_chunks document_id=%s file_type=%s", document_id, file_type)
     return list(
         iter_document_chunks(
             iter_extracted_segments(local_path, file_type),
@@ -418,10 +516,24 @@ def _replace_document_chunks(
     chunks: list[DocumentChunk],
     embeddings: list[list[float]],
 ) -> int:
+    logger.info("[STEP] documents.replace_document_chunks document_id=%s job_id=%s", document_id, job_id)
     if len(chunks) != len(embeddings):
+        logger.error(
+            "[FAILED] Chunk and embedding counts do not match document_id=%s job_id=%s chunks=%s embeddings=%s",
+            document_id,
+            job_id,
+            len(chunks),
+            len(embeddings),
+        )
         raise ValueError("Chunk and embedding counts do not match")
+    logger.info("[START] Cleaning staging before replacement document_id=%s job_id=%s", document_id, job_id)
     _cleanup_staging(document_id, job_id)
+    logger.info("[SUCCESS] Staging cleaned before replacement document_id=%s job_id=%s", document_id, job_id)
+    logger.info("[START] Inserting staging chunks document_id=%s job_id=%s", document_id, job_id)
     insert_staging_chunks(job_id, document_id, chunks, embeddings)
+    logger.info("[SUCCESS] Staging chunks inserted document_id=%s job_id=%s", document_id, job_id)
+    logger.info("[FINALIZE] Calling finalize_document_chunks RPC document_id=%s job_id=%s", document_id, job_id)
+    logger.info("[START] Finalizing document chunks document_id=%s job_id=%s", document_id, job_id)
     return finalize_document_chunks(document_id, job_id)
 
 
@@ -494,10 +606,17 @@ def _collection_ids_for_document(document_id: str, user_id: str) -> list[str]:
 
 
 def _update_document_metadata(document_id: str, metadata: dict[str, Any]) -> None:
-    supabase.table("documents").update({
-        "metadata": metadata,
-        "updated_at": _utc_now(),
-    }).eq("id", document_id).execute()
+    logger.info("[STEP] documents.update_document_metadata document_id=%s", document_id)
+    logger.info("[START] Supabase update documents metadata document_id=%s", document_id)
+    try:
+        supabase.table("documents").update({
+            "metadata": metadata,
+            "updated_at": _utc_now(),
+        }).eq("id", document_id).execute()
+    except Exception:
+        logger.exception("[FAILED] Supabase update documents metadata failed document_id=%s", document_id)
+        raise
+    logger.info("[SUCCESS] Supabase update documents metadata document_id=%s", document_id)
 
 
 def _update_ingestion(
@@ -513,6 +632,7 @@ def _update_ingestion(
     started: bool = False,
     completed: bool = False,
 ) -> None:
+    logger.info("[STEP] documents.update_ingestion document_id=%s status=%s", document_id, status_value)
     payload: dict[str, Any] = {
         "document_id": document_id,
         "status": status_value,
@@ -536,23 +656,40 @@ def _update_ingestion(
     if completed or status_value in TERMINAL_STATUSES:
         payload["completed_at"] = _utc_now()
 
-    supabase.table("document_ingestion").upsert(payload, on_conflict="document_id").execute()
+    logger.info("[START] Supabase upsert document_ingestion document_id=%s status=%s", document_id, status_value)
+    try:
+        supabase.table("document_ingestion").upsert(payload, on_conflict="document_id").execute()
+    except Exception:
+        logger.exception("[FAILED] Supabase upsert document_ingestion failed document_id=%s status=%s", document_id, status_value)
+        raise
+    logger.info("[SUCCESS] Supabase upsert document_ingestion document_id=%s status=%s", document_id, status_value)
 
 
 def _increment_ingestion_attempt(document_id: str) -> None:
+    logger.info("[STEP] documents.increment_ingestion_attempt document_id=%s", document_id)
     row = _get_ingestion_status(document_id) or {}
     attempt_count = int(row.get("attempt_count") or 0) + 1
-    supabase.table("document_ingestion").update({
-        "attempt_count": attempt_count,
-        "updated_at": _utc_now(),
-    }).eq("document_id", document_id).execute()
+    logger.info("[START] Supabase update document_ingestion attempt_count document_id=%s attempt_count=%s", document_id, attempt_count)
+    try:
+        supabase.table("document_ingestion").update({
+            "attempt_count": attempt_count,
+            "updated_at": _utc_now(),
+        }).eq("document_id", document_id).execute()
+    except Exception:
+        logger.exception("[FAILED] Supabase update attempt_count failed document_id=%s", document_id)
+        raise
+    logger.info("[SUCCESS] Supabase update attempt_count document_id=%s attempt_count=%s", document_id, attempt_count)
 
 
 def _cleanup_staging(document_id: str, job_id: str) -> None:
+    logger.info("[STEP] documents.cleanup_staging document_id=%s job_id=%s", document_id, job_id)
+    logger.info("[START] Supabase delete document_chunk_staging document_id=%s job_id=%s", document_id, job_id)
     try:
         supabase.table("document_chunk_staging").delete().eq("document_id", document_id).eq("job_id", job_id).execute()
     except Exception:
-        logger.warning("Could not clean document chunk staging rows", extra={"document_id": document_id, "job_id": job_id})
+        logger.warning("[FAILED] Could not clean document chunk staging rows", extra={"document_id": document_id, "job_id": job_id})
+        return
+    logger.info("[SUCCESS] Supabase delete document_chunk_staging document_id=%s job_id=%s", document_id, job_id)
 
 
 def _validated_storage_path(file_url: str | None, user_id: str) -> str:

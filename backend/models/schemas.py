@@ -47,3 +47,24 @@ class QueryResponse(BaseModel):
     answer: str
     diagnostics: Diagnostics
     session_id: Optional[str] = None
+
+class AgentInfo(BaseModel):
+    id: str
+    name: str
+    description: str
+    supported_scopes: List[str]
+    supported_tools: List[str]
+    supported_models: List[str]
+    agent_type: str
+    enabled: bool
+
+class PlatformHealthResponse(BaseModel):
+    status: str
+    uptime: int
+    agents_registered: int
+    active_model: str
+    vector_db_status: str
+    
+class PlatformMetrics(BaseModel):
+    uptime_seconds: int
+    agents: dict[str, Any]

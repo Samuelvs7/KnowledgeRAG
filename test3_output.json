@@ -1,0 +1,15 @@
+{
+  "signup": "success, user: 3f460932-994a-4c0b-8010-22744d789837",
+  "storage": {
+    "name": "StorageApiError",
+    "message": "new row violates row-level security policy",
+    "status": 400,
+    "statusCode": "403"
+  },
+  "db": {
+    "code": "PGRST205",
+    "details": null,
+    "hint": null,
+    "message": "Could not find the table 'public.documents' in the schema cache"
+  }
+}

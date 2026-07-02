@@ -1,0 +1,21 @@
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.6.0
+rootdir: E:\Projects\KnowledgeRAG\backend
+plugins: anyio-4.14.0, asyncio-1.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 35 items
+
+tests\test_agent_registry.py ...                                         [  8%]
+tests\test_ai_abstractions.py ...                                        [ 17%]
+tests\test_chunker.py .....                                              [ 31%]
+tests\test_citation_service.py .                                         [ 34%]
+tests\test_conversation_service.py .                                     [ 37%]
+tests\test_documents_helpers.py .......                                  [ 57%]
+tests\test_llm_helpers.py ....                                           [ 68%]
+tests\test_model_router.py .....                                         [ 82%]
+tests\test_plugin_manager.py .                                           [ 85%]
+tests\test_reranker.py ..                                                [ 91%]
+tests\test_retrieval_engine.py .                                         [ 94%]
+tests\test_streaming_service.py ..                                       [100%]
+
+============================= 35 passed in 4.31s ==============================

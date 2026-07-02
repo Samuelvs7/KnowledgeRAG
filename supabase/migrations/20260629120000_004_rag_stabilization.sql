@@ -102,7 +102,7 @@ CREATE OR REPLACE FUNCTION finalize_document_chunks(
 RETURNS INTEGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
   inserted_count INTEGER;
@@ -157,7 +157,7 @@ RETURNS TABLE (
 )
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
   SELECT
     dc.id,

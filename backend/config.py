@@ -16,8 +16,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_ANON_KEY")
     )
     gemini_api_key: str
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    ollama_base_url: str = "http://localhost:11434"
+    default_provider: str = "gemini"
 
-    embedding_model: str = "text-embedding-004"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
     llm_model: str = "gemini-2.0-flash"
     supabase_timeout_seconds: float = 20.0
@@ -29,7 +33,7 @@ class Settings(BaseSettings):
     ingestion_concurrency: int = 2
     max_document_bytes: int = 157_286_400
     cors_origins: str = Field(
-        default="http://localhost:5173", 
+        default="http://localhost:5173,http://127.0.0.1:5173",
         description="Comma separated list of allowed origins"
     )
 

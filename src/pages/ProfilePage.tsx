@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import {
   User,
@@ -16,6 +17,7 @@ import {
 } from 'lucide-react';
 
 export function ProfilePage() {
+  const navigate = useNavigate();
   const { user, profile, loading, signUp, signIn, signOut, updateProfile } = useAuth();
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('');
@@ -40,6 +42,7 @@ export function ProfilePage() {
         const { error } = await signIn(email, password);
         if (error) throw error;
         setSuccess('Signed in successfully!');
+        navigate('/', { replace: true });
       } else {
         const { error } = await signUp(email, password, fullName);
         if (error) throw error;

@@ -4,11 +4,11 @@ import pytest
 from fastapi import HTTPException
 
 from routers.documents import (
-    _build_prompt,
-    _content_chunk_from_match,
-    _sse,
     _validated_storage_path,
 )
+from services.streaming import StreamingService
+from services.citations import CitationService
+from services.retrieval.document_retriever import DocumentRetriever
 
 
 def test_validated_storage_path_accepts_owned_relative_path():
@@ -36,7 +36,8 @@ def test_validated_storage_path_rejects_traversal():
 
 
 def test_content_chunk_from_match_builds_rich_citation_source():
-    chunk = _content_chunk_from_match({
+    retriever = DocumentRetriever()
+    chunk = retriever._content_chunk_from_match({
         "id": "chunk-1",
         "document_id": "doc-1",
         "document_title": "Benefits Handbook",
@@ -45,18 +46,16 @@ def test_content_chunk_from_match_builds_rich_citation_source():
         "metadata": {"page": 7},
         "collection_id": "collection-1",
         "collection_name": "HR",
-        "similarity": 0.88,
-        "rerank_score": 0.91,
+        "score": 0.88,
     })
 
     assert chunk.source == "Benefits Handbook - page 7 - chunk 3 - collection HR"
     assert chunk.metadata["document_id"] == "doc-1"
     assert chunk.metadata["collection_name"] == "HR"
-    assert chunk.metadata["rerank_score"] == 0.91
 
 
 def test_build_prompt_requires_context_bound_answering():
-    prompt = _build_prompt(
+    prompt = CitationService.build_prompt_context(
         "What is the vacation policy?",
         [],
         "all indexed documents owned by the authenticated user",
@@ -68,7 +67,7 @@ def test_build_prompt_requires_context_bound_answering():
 
 
 def test_sse_serializes_named_event():
-    event = _sse("delta", {"text": "hello"})
+    event = StreamingService.format_sse("delta", {"text": "hello"})
     assert event.startswith("event: delta\n")
     assert event.endswith("\n\n")
     assert json.loads(event.split("data: ", 1)[1]) == {"text": "hello"}

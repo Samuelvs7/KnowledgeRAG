@@ -41,3 +41,10 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token does not identify a user")
     return AuthenticatedUser(id=str(user_id), email=payload.get("email"), access_token=credentials.credentials)
+
+def verify_agent_access(user: AuthenticatedUser, agent_name: str) -> None:
+    if agent_name == "admin_only_agent":
+        raise HTTPException(status_code=403, detail="Not authorized for this agent")
+
+def verify_resource_access(user: AuthenticatedUser, resource_type: str, resource_id: str) -> None:
+    pass
