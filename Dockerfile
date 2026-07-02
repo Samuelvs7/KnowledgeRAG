@@ -4,6 +4,15 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
+
+# Grab Railway's injected environment variables during the build stage
+ARG VITE_SUPABASE_URL
+ARG VITE_SUPABASE_ANON_KEY
+
+# Assign them so Vite bakes them into the bundled React JS
+ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL
+ENV VITE_SUPABASE_ANON_KEY=$VITE_SUPABASE_ANON_KEY
+
 # Setting empty placeholder API URL since we will serve it from the same origin locally
 ENV VITE_API_URL=""
 RUN npm run build

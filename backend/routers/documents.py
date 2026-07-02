@@ -3,10 +3,8 @@ import json
 import logging
 import tempfile
 import time
-import traceback
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -18,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from auth import AuthenticatedUser, get_current_user
 from config import settings
 from database import supabase
-from models.schemas import ContentChunk, Diagnostics, DocumentIngestRequest, QueryRequest
+from models.schemas import Diagnostics, DocumentIngestRequest, QueryRequest
 from services.chunker import DocumentChunk, iter_document_chunks
 from services.text_extractor import extract_metadata, iter_extracted_segments, normalize_file_type
 from services.vector_store import finalize_document_chunks, insert_staging_chunks
