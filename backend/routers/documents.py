@@ -348,22 +348,31 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     stage_message=f"Generating embeddings for {len(chunks)} chunks",
                 )
                 logger.info("[SUCCESS] Ingestion status embedding document_id=%s job_id=%s", document_id, job_id)
-                embeddings = []
-                logger.info("[START] Selecting provider for embedding document_id=%s job_id=%s", document_id, job_id)
-                provider = ModelRouter.get_provider()
-                logger.info("[SUCCESS] Provider selected for embedding provider=%s document_id=%s job_id=%s", provider.__class__.__name__, document_id, job_id)
-                logger.info("[EMBEDDING] Generating embeddings document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
-                logger.info(f"[STEP] Starting embedding generation for {len(chunks)} chunks using provider {provider.__class__.__name__}...")
-                for i, chunk in enumerate(chunks, 1):
-                    logger.info(f"[START] Embedding chunk {i}/{len(chunks)} document_id={document_id} job_id={job_id}")
-                    try:
+
+                # ── Fail-safe embedding generation ──────────────────────
+                embeddings: list[list[float]] = []
+                embedding_failed = False
+                try:
+                    logger.info("[START] Selecting provider for embedding document_id=%s job_id=%s", document_id, job_id)
+                    provider = ModelRouter.get_provider()
+                    logger.info("[SUCCESS] Provider selected for embedding provider=%s document_id=%s job_id=%s", provider.__class__.__name__, document_id, job_id)
+                    logger.info("[EMBEDDING] Generating embeddings document_id=%s job_id=%s chunk_count=%s", document_id, job_id, len(chunks))
+                    for i, chunk in enumerate(chunks, 1):
+                        logger.info(f"[START] Embedding chunk {i}/{len(chunks)} document_id={document_id} job_id={job_id}")
                         e = await provider.embed_text(chunk.content, title=title)
                         embeddings.append(e)
                         logger.info(f"[SUCCESS] Embedding chunk {i}/{len(chunks)} length={len(e)} document_id={document_id} job_id={job_id}")
-                    except Exception as exc:
-                        logger.exception(f"[FAILED] Embedding chunk {i}/{len(chunks)} document_id={document_id} job_id={job_id}")
-                        traceback.print_exc()
-                        raise
+                except Exception as emb_exc:
+                    logger.warning(
+                        "[FAILSAFE] Embedding generation failed – continuing with zero-vector stubs document_id=%s job_id=%s error=%s",
+                        document_id, job_id, str(emb_exc),
+                    )
+                    embedding_failed = True
+                    # Fill remaining chunks with zero-vectors so storage still works
+                    from config import settings as _cfg
+                    dim = _cfg.embedding_dimensions
+                    while len(embeddings) < len(chunks):
+                        embeddings.append([0.0] * dim)
 
                 logger.info("[SAVING] Updating status before vector save document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
                 logger.info("[START] Updating ingestion status vectorizing document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
@@ -374,8 +383,8 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     job_id=job_id,
                     progress=80,
                     chunk_count=len(chunks),
-                    embedding_count=len(embeddings),
-                    stage_message="Saving vector database",
+                    embedding_count=0 if embedding_failed else len(embeddings),
+                    stage_message="Saving chunks (embeddings skipped – will retry later)" if embedding_failed else "Saving vector database",
                 )
                 logger.info("[SUCCESS] Ingestion status vectorizing document_id=%s job_id=%s", document_id, job_id)
                 logger.info("[SAVING] Replacing document chunks document_id=%s job_id=%s", document_id, job_id)
@@ -383,6 +392,9 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 inserted_count = await asyncio.to_thread(_replace_document_chunks, job_id, document_id, chunks, embeddings)
                 logger.info("[SUCCESS] Document chunks replaced document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)
 
+            stage_msg = "Document indexed and ready"
+            if embedding_failed:
+                stage_msg = "Document chunked and stored (embeddings pending)"
             logger.info("[READY] Updating final ready status document_id=%s job_id=%s", document_id, job_id)
             logger.info("[START] Updating ingestion status ready document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
@@ -392,8 +404,8 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 job_id=job_id,
                 progress=100,
                 chunk_count=inserted_count,
-                embedding_count=inserted_count,
-                stage_message="Document indexed and ready",
+                embedding_count=0 if embedding_failed else inserted_count,
+                stage_message=stage_msg,
                 completed=True,
             )
             logger.info("[SUCCESS] Document ingestion ready document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)

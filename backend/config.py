@@ -5,7 +5,13 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_HERE = Path(__file__).resolve().parent
+_CANDIDATE_ENV_FILES = [
+    _HERE.parent / ".env",   # dev: backend/../.env
+    _HERE / ".env",           # Docker: /app/.env (if mounted)
+]
+ENV_FILE = next((p for p in _CANDIDATE_ENV_FILES if p.is_file()), _CANDIDATE_ENV_FILES[0])
+
 
 class Settings(BaseSettings):
     supabase_url: str
