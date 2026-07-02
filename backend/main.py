@@ -1,9 +1,13 @@
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 import logging
+import os
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from config import settings
 from logging_config import configure_logging
@@ -88,8 +92,26 @@ async def health_check():
         "embedding_dimensions": settings.embedding_dimensions,
     }
 
+# ---------------------------------------------------------------------------
+# Frontend Static File Serving (Docker single-container deployment)
+# ---------------------------------------------------------------------------
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+if STATIC_DIR.is_dir():
+    # Serve built frontend assets (JS, CSS, images) at /assets
+    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="frontend-assets")
+
+    # SPA catch-all: any non-API route returns index.html so React Router works
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # If the requested file exists in static dir, serve it directly
+        file_path = STATIC_DIR / full_path
+        if full_path and file_path.is_file():
+            return FileResponse(file_path)
+        # Otherwise return index.html for client-side routing
+        return FileResponse(STATIC_DIR / "index.html")
+
 if __name__ == "__main__":
     import uvicorn
-    import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

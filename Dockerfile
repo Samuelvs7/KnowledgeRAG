@@ -26,4 +26,6 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Run FastAPI with Gunicorn (4 workers) binding to the $PORT env var
-CMD ["gunicorn", "main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
+# Shell form is required so $PORT is expanded at runtime (Railway injects PORT dynamically)
+CMD gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT
+
