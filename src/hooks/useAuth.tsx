@@ -92,14 +92,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signUp = async (email: string, password: string, fullName?: string) => {
     try {
-      const { error } = await supabase.auth.signUp({
+      const { data, error } = await supabase.auth.signUp({
         email,
         password,
         options: {
           data: { full_name: fullName },
         },
       });
-      return { error };
+      if (error) return { error };
+
+      // Explicitly sign in if signup succeeded but no session was returned
+      if (!data.session) {
+        const signinRes = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        return { error: signinRes.error };
+      }
+      return { error: null };
     } catch (error) {
       return { error: error as Error };
     }
