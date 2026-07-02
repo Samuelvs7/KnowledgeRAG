@@ -159,6 +159,7 @@ async def stream_query_documents(
             
             yield _sse("context", {"diagnostics": _model_dump(diagnostics), "session_id": session_id})
             
+            llm_start = time.perf_counter()
             answer_parts = []
             async for delta in generator:
                 answer_parts.append(delta)
@@ -166,10 +167,10 @@ async def stream_query_documents(
                 
             answer = "".join(answer_parts).strip()
             
-            # Reconstruct diagnostics with total usage from stream (simulated here since stream_text does not output tokens yet)
             payload = _model_dump(diagnostics)
-            payload["llmTimeMs"] = int(time.perf_counter() * 1000) - payload["totalTimeMs"]
-            payload["totalTimeMs"] = int(time.perf_counter() * 1000)
+            llm_time = int((time.perf_counter() - llm_start) * 1000)
+            payload["llmTimeMs"] = llm_time
+            payload["totalTimeMs"] = int(payload.get("totalTimeMs") or 0) + llm_time
             final_diagnostics = Diagnostics(**payload)
             
             await asyncio.to_thread(MemoryService.add_message, session_id, "assistant", answer, citations=[c.model_dump() for c in context_chunks])
@@ -349,7 +350,6 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
 
                 # ── Fail-safe embedding generation ──────────────────────
                 embeddings: list[list[float]] = []
-                embedding_failed = False
                 try:
                     logger.info("[START] Selecting provider for embedding document_id=%s job_id=%s", document_id, job_id)
                     provider = ModelRouter.get_provider()
@@ -361,6 +361,12 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                         embeddings.append(e)
                         logger.info(f"[SUCCESS] Embedding chunk {i}/{len(chunks)} length={len(e)} document_id={document_id} job_id={job_id}")
                 except Exception as emb_exc:
+                    logger.exception(
+                        "[FAILED] Embedding generation failed document_id=%s job_id=%s",
+                        document_id,
+                        job_id,
+                    )
+                    raise RuntimeError("Embedding generation failed; document was not indexed") from emb_exc
                     logger.warning(
                         "[FAILSAFE] Embedding generation failed – continuing with zero-vector stubs document_id=%s job_id=%s error=%s",
                         document_id, job_id, str(emb_exc),
@@ -381,7 +387,7 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     job_id=job_id,
                     progress=80,
                     chunk_count=len(chunks),
-                    embedding_count=0 if embedding_failed else len(embeddings),
+                    embedding_count=len(embeddings),
                     stage_message="Saving chunks (embeddings skipped – will retry later)" if embedding_failed else "Saving vector database",
                 )
                 logger.info("[SUCCESS] Ingestion status vectorizing document_id=%s job_id=%s", document_id, job_id)
