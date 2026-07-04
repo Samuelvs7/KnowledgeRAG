@@ -11,8 +11,13 @@ def test_model_router_mock():
     assert isinstance(provider, MockProvider)
 
 def test_model_router_default():
+    from config import settings
+    from services.ai.providers.groq import GroqProvider
     provider = ModelRouter.get_provider("unknown_model_123")
-    assert isinstance(provider, GeminiProvider)
+    if settings.llm_provider.lower() == "groq":
+        assert isinstance(provider, GroqProvider)
+    else:
+        assert isinstance(provider, GeminiProvider)
 
 def test_model_router_claude():
     provider = ModelRouter.get_provider("claude-3-5-sonnet")

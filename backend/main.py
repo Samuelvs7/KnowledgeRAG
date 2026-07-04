@@ -69,7 +69,8 @@ def _log_startup_diagnostics() -> None:
     logger.info("[SUCCESS] HUGGINGFACE_API_KEY loaded=%s", bool(settings.huggingface_api_key))
     logger.info("[SUCCESS] Embedding model=%s", settings.embedding_model)
     logger.info("[SUCCESS] Embedding dimensions=%s", settings.embedding_dimensions)
-    logger.info("[SUCCESS] Provider selected=%s", settings.default_provider)
+    logger.info("[SUCCESS] LLM model=%s", settings.llm_model)
+    logger.info("[SUCCESS] LLM provider=%s", settings.llm_provider)
     logger.info("[SUCCESS] CORS origins=%s", settings.allowed_origins)
 
     logger.info("[STEP] startup.gemini_sdk")

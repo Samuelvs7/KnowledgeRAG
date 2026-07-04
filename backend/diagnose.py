@@ -35,7 +35,7 @@ try:
     print(f"[OK] Embedding model       = {settings.embedding_model}")
     print(f"[OK] Embedding dimensions  = {settings.embedding_dimensions}")
     print(f"[OK] LLM model             = {settings.llm_model}")
-    print(f"[OK] Default provider      = {settings.default_provider}")
+    print(f"[OK] LLM provider          = {settings.llm_provider}")
 except Exception:
     print("[FAILED] Could not load settings")
     traceback.print_exc()
