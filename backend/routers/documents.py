@@ -348,7 +348,7 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 )
                 logger.info("[SUCCESS] Ingestion status embedding document_id=%s job_id=%s", document_id, job_id)
 
-                # ── Fail-safe embedding generation ──────────────────────
+                # Generate embeddings; any provider failure marks the ingestion as failed.
                 embeddings: list[list[float]] = []
                 try:
                     logger.info("[START] Selecting provider for embedding document_id=%s job_id=%s", document_id, job_id)
@@ -366,17 +366,7 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                         document_id,
                         job_id,
                     )
-                    raise RuntimeError("Embedding generation failed; document was not indexed") from emb_exc
-                    logger.warning(
-                        "[FAILSAFE] Embedding generation failed – continuing with zero-vector stubs document_id=%s job_id=%s error=%s",
-                        document_id, job_id, str(emb_exc),
-                    )
-                    embedding_failed = True
-                    # Fill remaining chunks with zero-vectors so storage still works
-                    from config import settings as _cfg
-                    dim = _cfg.embedding_dimensions
-                    while len(embeddings) < len(chunks):
-                        embeddings.append([0.0] * dim)
+                    raise RuntimeError(f"Embedding generation failed: {emb_exc}") from emb_exc
 
                 logger.info("[SAVING] Updating status before vector save document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
                 logger.info("[START] Updating ingestion status vectorizing document_id=%s job_id=%s embeddings=%s", document_id, job_id, len(embeddings))
@@ -388,7 +378,7 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                     progress=80,
                     chunk_count=len(chunks),
                     embedding_count=len(embeddings),
-                    stage_message="Saving chunks (embeddings skipped – will retry later)" if embedding_failed else "Saving vector database",
+                    stage_message="Saving vector database",
                 )
                 logger.info("[SUCCESS] Ingestion status vectorizing document_id=%s job_id=%s", document_id, job_id)
                 logger.info("[SAVING] Replacing document chunks document_id=%s job_id=%s", document_id, job_id)
@@ -396,9 +386,6 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 inserted_count = await asyncio.to_thread(_replace_document_chunks, job_id, document_id, chunks, embeddings)
                 logger.info("[SUCCESS] Document chunks replaced document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)
 
-            stage_msg = "Document indexed and ready"
-            if embedding_failed:
-                stage_msg = "Document chunked and stored (embeddings pending)"
             logger.info("[READY] Updating final ready status document_id=%s job_id=%s", document_id, job_id)
             logger.info("[START] Updating ingestion status ready document_id=%s job_id=%s", document_id, job_id)
             await asyncio.to_thread(
@@ -408,8 +395,8 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
                 job_id=job_id,
                 progress=100,
                 chunk_count=inserted_count,
-                embedding_count=0 if embedding_failed else inserted_count,
-                stage_message=stage_msg,
+                embedding_count=inserted_count,
+                stage_message="Document indexed and ready",
                 completed=True,
             )
             logger.info("[SUCCESS] Document ingestion ready document_id=%s job_id=%s inserted_count=%s", document_id, job_id, inserted_count)
@@ -425,7 +412,6 @@ async def _run_ingestion(document_id: str, user_id: str, job_id: str) -> None:
             raise
         except Exception as exc:
             logger.exception("[FAILED] Document ingestion failed", extra={"document_id": document_id, "job_id": job_id})
-            traceback.print_exc()
             await asyncio.to_thread(_cleanup_staging, document_id, job_id)
             await asyncio.to_thread(
                 _update_ingestion,

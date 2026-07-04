@@ -1,37 +1,29 @@
-import os
+import asyncio
 import sys
+from pathlib import Path
 
-# Load env
 from dotenv import load_dotenv
-load_dotenv('e:/Projects/KnowledgeRAG/.env')
 
-sys.path.append('e:/Projects/KnowledgeRAG/backend')
-from config import settings
-from google import genai
-from google.genai import types
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+sys.path.append(str(ROOT / "backend"))
 
-def test_embed():
-    print("Testing gemini client...")
-    client = genai.Client(api_key=settings.gemini_api_key)
-    try:
-        result = client.models.embed_content(
-            model=settings.embedding_model,
-            contents="hello world",
-            config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+from config import settings  # noqa: E402
+from services.embeddings import embed_text  # noqa: E402
+
+
+async def main() -> None:
+    print(
+        "Testing shared embedding provider:",
+        settings.embedding_provider,
+        settings.embedding_model,
+    )
+    embedding = await embed_text("hello world", title="Smoke Test")
+    print("Embedding dimensions:", len(embedding))
+    if len(embedding) != settings.embedding_dimensions:
+        raise RuntimeError(
+            f"Expected {settings.embedding_dimensions} dimensions, got {len(embedding)}"
         )
-        print("Success! Got result:", result)
-        
-        # Test my extract logic
-        embeddings = getattr(result, "embeddings", None)
-        if embeddings is None and isinstance(result, dict):
-            embeddings = result.get("embeddings") or result.get("embedding")
-        first = embeddings[0] if isinstance(embeddings, list) else embeddings
-        values = getattr(first, "values", None)
-        print("Values length:", len(values))
-        
-    except Exception as e:
-        print("Exception thrown!!!")
-        import traceback
-        traceback.print_exc()
 
-test_embed()
+
+asyncio.run(main())

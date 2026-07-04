@@ -12,3 +12,4 @@ httpx
 tiktoken
 pytest
 pytest-asyncio
+groq

@@ -8,7 +8,16 @@ T = TypeVar("T")
 
 
 def is_transient_error(exc: Exception) -> bool:
-    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    response = getattr(exc, "response", None)
+    status = (
+        getattr(exc, "status_code", None)
+        or getattr(response, "status_code", None)
+        or getattr(exc, "code", None)
+    )
+    if isinstance(status, str) and status.isdigit():
+        status = int(status)
+    if status in {400, 401, 403, 404, 422}:
+        return False
     if status in {408, 409, 425, 429, 500, 502, 503, 504}:
         return True
 

@@ -17,6 +17,7 @@ class BaseProvider(ABC):
     async def stream_text(self, prompt: str, *, system_instruction: str | None = None) -> AsyncIterator[str]:
         pass
 
-    @abstractmethod
     async def embed_text(self, text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
-        pass
+        from services.embeddings import embed_text
+
+        return await embed_text(text, title=title, is_query=is_query)

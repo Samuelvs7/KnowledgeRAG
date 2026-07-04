@@ -1,47 +1,67 @@
 import asyncio
 import logging
 import time
-import traceback
 from typing import Any
 
 from google import genai
 from google.genai import types
 
 from config import settings
+from services.ai.providers.huggingface import HuggingFaceEmbeddingProvider
 from services.retry import is_transient_error, with_retry
 
 
 logger = logging.getLogger(__name__)
-
-logger.info("[STEP] embeddings.gemini_client")
-logger.info("[START] Initializing shared Gemini embedding client")
-try:
-    client = genai.Client(api_key=settings.gemini_api_key)
-except Exception:
-    logger.exception("[FAILED] Shared Gemini embedding client initialization failed")
-    traceback.print_exc()
-    raise
-logger.info("[SUCCESS] Shared Gemini embedding client initialized")
+_gemini_client: genai.Client | None = None
+_huggingface_provider: HuggingFaceEmbeddingProvider | None = None
 
 
-async def embed_text(text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
+async def embed_text(
+    text: str,
+    *,
+    title: str | None = None,
+    is_query: bool = False,
+) -> list[float]:
+    logger.info(
+        "[STEP] embeddings.embed_text provider=%s model=%s dimensions=%s text_chars=%s is_query=%s",
+        settings.embedding_provider,
+        settings.embedding_model,
+        settings.embedding_dimensions,
+        len(text or ""),
+        is_query,
+    )
+    if settings.embedding_provider == "huggingface":
+        return await _get_huggingface_provider().embed_text(
+            text,
+            title=title,
+            is_query=is_query,
+        )
+
+    started = time.perf_counter()
+
     async def operation() -> list[float]:
-        return await asyncio.to_thread(_embed_text_sync, text, title, is_query)
+        return await asyncio.to_thread(_embed_gemini_sync, text, title, is_query)
 
-    logger.info("[STEP] embeddings.embed_text text_chars=%s is_query=%s", len(text or ""), is_query)
-    logger.info("[START] Shared embedding generation model=%s dimensions=%s", settings.embedding_model, settings.embedding_dimensions)
     try:
-        embedding = await with_retry(
+        return await with_retry(
             operation,
             attempts=settings.max_retry_attempts,
             timeout_seconds=settings.embedding_timeout_seconds,
         )
     except Exception:
-        logger.exception("[FAILED] Shared embedding generation failed")
-        traceback.print_exc()
+        logger.exception(
+            "[FAILED] Gemini embedding failed model=%s dimensions=%s",
+            settings.embedding_model,
+            settings.embedding_dimensions,
+        )
         raise
-    logger.info("[SUCCESS] Shared embedding generated length=%s", len(embedding))
-    return embedding
+    finally:
+        logger.info(
+            "[METRIC] Gemini embedding total model=%s dimensions=%s embedding_time_ms=%s",
+            settings.embedding_model,
+            settings.embedding_dimensions,
+            int((time.perf_counter() - started) * 1000),
+        )
 
 
 async def embed_texts(texts: list[str], *, title: str | None = None) -> list[list[float]]:
@@ -56,17 +76,25 @@ async def embed_texts(texts: list[str], *, title: str | None = None) -> list[lis
 
 def get_embeddings(texts: list[str]) -> list[list[float]]:
     """Compatibility wrapper for synchronous product/indexing callers."""
-    return [_embed_with_sync_retry(text, None, False) for text in texts]
+    return [_embed_text_sync(text, None, False) for text in texts]
+
 
 def get_query_embedding(query: str) -> list[float]:
-    return _embed_with_sync_retry(query, None, True)
+    return _embed_text_sync(query, None, True)
 
 
-def _embed_with_sync_retry(text: str, title: str | None, is_query: bool) -> list[float]:
+def _embed_text_sync(text: str, title: str | None, is_query: bool) -> list[float]:
+    if settings.embedding_provider == "huggingface":
+        return _get_huggingface_provider().embed_text_sync(
+            text,
+            title=title,
+            is_query=is_query,
+        )
+
     last_error: Exception | None = None
     for attempt in range(1, settings.max_retry_attempts + 1):
         try:
-            return _embed_text_sync(text, title, is_query)
+            return _embed_gemini_sync(text, title, is_query)
         except Exception as exc:
             last_error = exc
             if attempt >= settings.max_retry_attempts or not is_transient_error(exc):
@@ -75,39 +103,51 @@ def _embed_with_sync_retry(text: str, title: str | None, is_query: bool) -> list
     raise RuntimeError("Embedding call ended without a result") from last_error
 
 
-def _embed_text_sync(text: str, title: str | None, is_query: bool) -> list[float]:
-    prepared = _prepare_embedding_text(text, title=title, is_query=is_query)
+def _get_huggingface_provider() -> HuggingFaceEmbeddingProvider:
+    global _huggingface_provider
+    if _huggingface_provider is None:
+        _huggingface_provider = HuggingFaceEmbeddingProvider(
+            api_key=settings.huggingface_api_key,
+            model=settings.embedding_model,
+            target_dimensions=settings.embedding_dimensions,
+            timeout_seconds=settings.embedding_timeout_seconds,
+            max_retry_attempts=settings.max_retry_attempts,
+        )
+    return _huggingface_provider
+
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        logger.info("[START] Initializing Gemini embedding client")
+        _gemini_client = genai.Client(api_key=settings.gemini_api_key)
+        logger.info("[SUCCESS] Gemini embedding client initialized")
+    return _gemini_client
+
+
+def _embed_gemini_sync(text: str, title: str | None, is_query: bool) -> list[float]:
+    prepared = _prepare_gemini_text(text, title=title, is_query=is_query)
     logger.info(
-        "[START] Calling shared Gemini embed_content model=%s dimensions=%s prepared_chars=%s",
+        "[REQUEST] Gemini embedding model=%s dimensions=%s prepared_chars=%s",
         settings.embedding_model,
         settings.embedding_dimensions,
         len(prepared),
     )
-    try:
-        result = client.models.embed_content(
-            model=settings.embedding_model,
-            contents=prepared,
-            config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
-        )
-    except Exception:
-        logger.exception("[FAILED] Shared Gemini embed_content call failed")
-        traceback.print_exc()
-        raise
-    embedding = _extract_embedding_values(result)
+    result = _get_gemini_client().models.embed_content(
+        model=settings.embedding_model,
+        contents=prepared,
+        config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+    )
+    embedding = _extract_gemini_values(result)
     if len(embedding) != settings.embedding_dimensions:
-        logger.error(
-            "[FAILED] Shared embedding dimension mismatch expected=%s got=%s",
-            settings.embedding_dimensions,
-            len(embedding),
-        )
         raise ValueError(
             f"Embedding dimension mismatch: expected {settings.embedding_dimensions}, got {len(embedding)}"
         )
-    logger.info("[SUCCESS] Shared Gemini embed_content returned embedding_length=%s", len(embedding))
+    logger.info("[SUCCESS] Gemini embedding returned dimensions=%s", len(embedding))
     return embedding
 
 
-def _prepare_embedding_text(text: str, *, title: str | None, is_query: bool) -> str:
+def _prepare_gemini_text(text: str, *, title: str | None, is_query: bool) -> str:
     cleaned = " ".join((text or "").split())
     if is_query:
         return f"task: question answering | query: {cleaned}"
@@ -115,7 +155,7 @@ def _prepare_embedding_text(text: str, *, title: str | None, is_query: bool) -> 
     return f"task: document retrieval | {prefix}text: {cleaned}"
 
 
-def _extract_embedding_values(result: Any) -> list[float]:
+def _extract_gemini_values(result: Any) -> list[float]:
     embeddings = getattr(result, "embeddings", None)
     if embeddings is None and isinstance(result, dict):
         embeddings = result.get("embeddings") or result.get("embedding")

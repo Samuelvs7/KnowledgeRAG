@@ -16,8 +16,3 @@ class ClaudeProvider(BaseProvider):
             raise ValueError("Anthropic API key not configured")
         raise NotImplementedError("Claude integration scaffolding only")
         yield ""
-
-    async def embed_text(self, text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
-        if not settings.anthropic_api_key:
-            raise ValueError("Anthropic API key not configured")
-        raise NotImplementedError("Claude integration scaffolding only")

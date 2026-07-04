@@ -2,230 +2,150 @@
 Complete diagnostic script for the KnowledgeRAG ingestion pipeline.
 Run from backend/ directory:  python diagnose.py
 """
-import sys
+import asyncio
+import inspect
 import os
+import sys
 import traceback
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-def section(title: str):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
 
-# ── STEP 4: Verify environment variables ──────────────────────
-section("STEP 4: Environment Variables")
+def section(title: str) -> None:
+    print(f"\n{'=' * 60}")
+    print(f"  {title}")
+    print(f"{'=' * 60}")
+
+
+def mask(value: str | None, keep: int = 8) -> str:
+    if not value:
+        return "missing"
+    return f"{value[:keep]}..."
+
+
+section("STEP 1: Environment Variables")
 try:
     from config import settings
-    print(f"[OK] SUPABASE_URL        = {settings.supabase_url[:40]}...")
-    print(f"[OK] SUPABASE_KEY        = {settings.supabase_service_role_key[:15]}...")
-    print(f"[OK] GEMINI_API_KEY      = {settings.gemini_api_key[:15]}...")
-    print(f"[OK] Embedding model     = {settings.embedding_model}")
-    print(f"[OK] Embedding dims      = {settings.embedding_dimensions}")
-    print(f"[OK] LLM model           = {settings.llm_model}")
-    print(f"[OK] Default provider    = {settings.default_provider}")
+
+    print(f"[OK] SUPABASE_URL          = {mask(settings.supabase_url, 40)}")
+    print(f"[OK] SUPABASE_KEY          = {mask(settings.supabase_service_role_key, 12)}")
+    print(f"[OK] GEMINI_API_KEY        = {mask(settings.gemini_api_key, 8)}")
+    print(f"[OK] HUGGINGFACE_API_KEY   = {'configured' if settings.huggingface_api_key else 'missing'}")
+    print(f"[OK] Embedding provider    = {settings.embedding_provider}")
+    print(f"[OK] Embedding model       = {settings.embedding_model}")
+    print(f"[OK] Embedding dimensions  = {settings.embedding_dimensions}")
+    print(f"[OK] LLM model             = {settings.llm_model}")
+    print(f"[OK] Default provider      = {settings.default_provider}")
 except Exception:
     print("[FAILED] Could not load settings")
     traceback.print_exc()
     sys.exit(1)
 
-# ── STEP 5: Verify Gemini SDK ──────────────────────────────────
-section("STEP 5: Gemini SDK Verification")
+
+section("STEP 2: Gemini SDK Verification for Chat/QA")
 try:
     import google.genai as genai_pkg
-    print(f"[OK] google-genai package version: {getattr(genai_pkg, '__version__', 'unknown')}")
-except Exception:
-    print("[FAILED] google-genai not installed")
-    traceback.print_exc()
-    sys.exit(1)
-
-try:
     from google import genai
     from google.genai import types
-    print(f"[OK] genai module imported")
-    print(f"[OK] types module imported")
 
-    # Check EmbedContentConfig fields
-    import inspect
-    sig = inspect.signature(types.EmbedContentConfig.__init__)
-    params = list(sig.parameters.keys())
-    print(f"[OK] EmbedContentConfig params: {params}")
-    has_output_dim = 'output_dimensionality' in params
-    print(f"[INFO] Has output_dimensionality: {has_output_dim}")
-except Exception:
-    print("[FAILED] Could not inspect genai types")
-    traceback.print_exc()
-    sys.exit(1)
-
-# ── Test embedding call ────────────────────────────────────────
-section("STEP 5b: Live Gemini Embedding Test")
-try:
+    print(f"[OK] google-genai package version: {getattr(genai_pkg, '__version__', 'unknown')}")
+    print("[OK] genai module imported")
+    print("[OK] Gemini GenerateContentConfig available:", hasattr(types, "GenerateContentConfig"))
     client = genai.Client(api_key=settings.gemini_api_key)
-    print(f"[OK] Gemini client created")
-    
-    print(f"[START] Calling embed_content with model={settings.embedding_model}...")
-    result = client.models.embed_content(
-        model=settings.embedding_model,
-        contents="Hello world",
-        config=types.EmbedContentConfig(),
-    )
-    print(f"[OK] embed_content returned. Type: {type(result)}")
-    print(f"[OK] Result attributes: {[a for a in dir(result) if not a.startswith('_')]}")
-    
-    embeddings = getattr(result, "embeddings", None)
-    print(f"[OK] result.embeddings type: {type(embeddings)}")
-    
-    if embeddings is None:
-        print(f"[WARN] result.embeddings is None, trying dict access...")
-        if isinstance(result, dict):
-            embeddings = result.get("embeddings") or result.get("embedding")
-    
-    if not embeddings:
-        print(f"[FAILED] No embeddings in response!")
-        print(f"[DEBUG] Full result repr: {repr(result)}")
-        sys.exit(1)
-    
-    first = embeddings[0] if isinstance(embeddings, list) else embeddings
-    print(f"[OK] First embedding type: {type(first)}")
-    print(f"[OK] First embedding attrs: {[a for a in dir(first) if not a.startswith('_')]}")
-    
-    values = getattr(first, "values", None)
-    if values is None and isinstance(first, dict):
-        values = first.get("values") or first.get("embedding")
-    
-    if values is None:
-        print(f"[FAILED] No values in embedding!")
-        print(f"[DEBUG] First embedding repr: {repr(first)}")
-        sys.exit(1)
-    
-    values_list = [float(v) for v in values]
-    print(f"[OK] Embedding length: {len(values_list)}")
-    print(f"[OK] First 5 values: {values_list[:5]}")
-    
-    if len(values_list) != settings.embedding_dimensions:
-        print(f"[WARN] Dimension mismatch! Expected {settings.embedding_dimensions}, got {len(values_list)}")
-    else:
-        print(f"[OK] Dimensions match: {settings.embedding_dimensions}")
-        
+    print(f"[OK] Gemini client created for chat model {settings.llm_model}")
 except Exception:
-    print("[FAILED] Gemini embedding test failed!")
+    print("[FAILED] Gemini chat SDK verification failed")
     traceback.print_exc()
     sys.exit(1)
 
-# ── Test GeminiProvider class ──────────────────────────────────
-section("STEP 5c: GeminiProvider Class Test")
+
+section("STEP 3: Shared Embedding Interface")
 try:
-    from services.ai.providers.gemini import GeminiProvider
-    provider = GeminiProvider()
-    print(f"[OK] GeminiProvider instantiated")
-    
-    import asyncio
-    
-    async def test_provider():
-        print(f"[START] provider.embed_text('Hello world')...")
-        embedding = await provider.embed_text("Hello world", title="Test")
+    from services.embeddings import embed_text
+
+    async def test_shared_embedding() -> list[float]:
+        print(f"[START] embed_text via provider={settings.embedding_provider} model={settings.embedding_model}")
+        embedding = await embed_text("Hello world", title="Diagnostic")
         print(f"[OK] embed_text returned {len(embedding)} dimensions")
-        print(f"[OK] First 5: {embedding[:5]}")
+        print(f"[OK] First 5 values: {embedding[:5]}")
         return embedding
-    
-    embedding = asyncio.run(test_provider())
-    print(f"[OK] GeminiProvider.embed_text works!")
+
+    values = asyncio.run(test_shared_embedding())
+    if len(values) != settings.embedding_dimensions:
+        raise RuntimeError(
+            f"Dimension mismatch: expected {settings.embedding_dimensions}, got {len(values)}"
+        )
+    print(f"[OK] Dimensions match: {settings.embedding_dimensions}")
 except Exception:
-    print("[FAILED] GeminiProvider class test failed!")
+    print("[FAILED] Shared embedding interface failed")
     traceback.print_exc()
     sys.exit(1)
 
-# ── Test ModelRouter ───────────────────────────────────────────
-section("STEP 5d: ModelRouter Test")
+
+section("STEP 4: ModelRouter Embedding Interface")
 try:
     from services.ai.router import ModelRouter
+
     provider = ModelRouter.get_provider()
     print(f"[OK] ModelRouter.get_provider() = {provider.__class__.__name__}")
-    
-    import asyncio
-    
-    async def test_router():
-        embedding = await provider.embed_text("Router test", title="Test")
-        print(f"[OK] ModelRouter embedding: {len(embedding)} dims")
-        return embedding
-    
-    asyncio.run(test_router())
+
+    async def test_router_embedding() -> None:
+        embedding = await provider.embed_text("Router test", title="Diagnostic")
+        print(f"[OK] Provider embed_text delegated to shared embeddings: {len(embedding)} dims")
+
+    asyncio.run(test_router_embedding())
 except Exception:
-    print("[FAILED] ModelRouter test failed!")
+    print("[FAILED] ModelRouter embedding interface failed")
     traceback.print_exc()
     sys.exit(1)
 
-# ── Test Supabase connectivity ─────────────────────────────────
-section("STEP 6a: Supabase Database Connectivity")
+
+section("STEP 5: Supabase Database Connectivity")
 try:
     from database import supabase
-    print(f"[OK] Supabase client created")
-    
-    # Test basic query
+
     result = supabase.table("documents").select("id").limit(1).execute()
     print(f"[OK] Supabase documents table accessible. Rows returned: {len(result.data or [])}")
 except Exception:
-    print("[FAILED] Supabase connectivity test failed!")
+    print("[FAILED] Supabase connectivity test failed")
     traceback.print_exc()
 
-# ── Test staging table ─────────────────────────────────────────
-section("STEP 6b: Staging Table Test")
+
+section("STEP 6: Staging Table")
 try:
     result = supabase.table("document_chunk_staging").select("job_id").limit(1).execute()
-    print(f"[OK] document_chunk_staging table accessible")
+    print("[OK] document_chunk_staging table accessible")
 except Exception:
-    print("[FAILED] document_chunk_staging table test failed!")
+    print("[FAILED] document_chunk_staging table test failed")
     traceback.print_exc()
 
-# ── Test vector_store functions ─────────────────────────────────
-section("STEP 6c: Vector Store Functions")
+
+section("STEP 7: Vector Store Functions")
 try:
-    from services.vector_store import insert_staging_chunks, finalize_document_chunks
-    print(f"[OK] insert_staging_chunks imported")
-    print(f"[OK] finalize_document_chunks imported")
-    
-    import inspect
-    sig_insert = inspect.signature(insert_staging_chunks)
-    sig_finalize = inspect.signature(finalize_document_chunks)
-    print(f"[OK] insert_staging_chunks signature: {sig_insert}")
-    print(f"[OK] finalize_document_chunks signature: {sig_finalize}")
+    from services.vector_store import finalize_document_chunks, insert_staging_chunks
+
+    print("[OK] insert_staging_chunks imported")
+    print("[OK] finalize_document_chunks imported")
+    print(f"[OK] insert_staging_chunks signature: {inspect.signature(insert_staging_chunks)}")
+    print(f"[OK] finalize_document_chunks signature: {inspect.signature(finalize_document_chunks)}")
 except Exception:
-    print("[FAILED] vector_store import failed!")
+    print("[FAILED] vector_store import failed")
     traceback.print_exc()
 
-# ── Test retry module ──────────────────────────────────────────
-section("STEP 6d: Retry Module")
+
+section("STEP 8: Retry Module")
 try:
-    from services.retry import with_retry, is_transient_error
-    print(f"[OK] retry module imported")
-    
-    import inspect
-    sig = inspect.signature(with_retry)
-    print(f"[OK] with_retry signature: {sig}")
+    from services.retry import is_transient_error, with_retry
+
+    print("[OK] retry module imported")
+    print(f"[OK] with_retry signature: {inspect.signature(with_retry)}")
+    print(f"[OK] 401 transient? {is_transient_error(Exception('401 authentication failed'))}")
+    print(f"[OK] 503 transient? {is_transient_error(Exception('503 server unavailable'))}")
 except Exception:
-    print("[FAILED] retry module test failed!")
+    print("[FAILED] retry module test failed")
     traceback.print_exc()
 
-# ── Verify vector_store internals ──────────────────────────────
-section("STEP 6e: Inspect vector_store.py source")
-try:
-    import services.vector_store as vs
-    src = inspect.getsource(vs)
-    print(f"[OK] vector_store.py source length: {len(src)} chars")
-    
-    # Check for common issues
-    if "document_chunk_staging" in src:
-        print(f"[OK] Uses document_chunk_staging table")
-    if "finalize_document_chunks" in src:
-        print(f"[OK] Has finalize_document_chunks function")
-    if "rpc" in src.lower():
-        print(f"[OK] Uses RPC calls")
-    else:
-        print(f"[WARN] No RPC calls found in vector_store.py")
-except Exception:
-    print("[FAILED] vector_store inspection failed!")
-    traceback.print_exc()
 
-print(f"\n{'='*60}")
-print(f"  DIAGNOSTIC COMPLETE")
-print(f"{'='*60}")
+print(f"\n{'=' * 60}")
+print("  DIAGNOSTIC COMPLETE")
+print(f"{'=' * 60}")

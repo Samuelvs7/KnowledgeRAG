@@ -65,6 +65,8 @@ def _log_startup_diagnostics() -> None:
     logger.info("[SUCCESS] SUPABASE_URL loaded=%s", bool(settings.supabase_url))
     logger.info("[SUCCESS] SUPABASE_SERVICE_ROLE_KEY loaded=%s", bool(settings.supabase_service_role_key))
     logger.info("[SUCCESS] GEMINI_API_KEY loaded=%s", bool(settings.gemini_api_key))
+    logger.info("[SUCCESS] Embedding provider=%s", settings.embedding_provider)
+    logger.info("[SUCCESS] HUGGINGFACE_API_KEY loaded=%s", bool(settings.huggingface_api_key))
     logger.info("[SUCCESS] Embedding model=%s", settings.embedding_model)
     logger.info("[SUCCESS] Embedding dimensions=%s", settings.embedding_dimensions)
     logger.info("[SUCCESS] Provider selected=%s", settings.default_provider)
@@ -77,7 +79,7 @@ def _log_startup_diagnostics() -> None:
 
         logger.info("[SUCCESS] Gemini SDK version=%s", getattr(genai_pkg, "__version__", "unknown"))
         logger.info("[SUCCESS] Installed package google-genai version=%s", _package_version("google-genai"))
-        logger.info("[SUCCESS] Embedding model name=%s", settings.embedding_model)
+        logger.info("[SUCCESS] Gemini chat model name=%s", settings.llm_model)
     except Exception:
         logger.exception("[FAILED] Gemini SDK inspection failed")
         raise
@@ -88,6 +90,7 @@ async def health_check():
     return {
         "status": "online",
         "model": settings.llm_model,
+        "embedding_provider": settings.embedding_provider,
         "embedding_model": settings.embedding_model,
         "embedding_dimensions": settings.embedding_dimensions,
     }

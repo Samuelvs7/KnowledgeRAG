@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,12 +24,21 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("SUPABASE_PUBLISHABLE_KEY", "VITE_SUPABASE_ANON_KEY")
     )
     gemini_api_key: str
+    groq_api_key: str | None = None
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     ollama_base_url: str = "http://localhost:11434"
-    default_provider: str = "gemini"
+    llm_provider: str = Field(
+        default="gemini",
+        validation_alias=AliasChoices("LLM_PROVIDER", "DEFAULT_PROVIDER")
+    )
 
-    embedding_model: str = "gemini-embedding-001"
+    embedding_provider: Literal["gemini", "huggingface"] = "gemini"
+    huggingface_api_key: str | None = None
+    gemini_embedding_model: str = Field(
+        default="gemini-embedding-001",
+        validation_alias=AliasChoices("GEMINI_EMBEDDING_MODEL", "EMBEDDING_MODEL"),
+    )
     embedding_dimensions: int = 768
     llm_model: str = "gemini-2.0-flash"
     supabase_timeout_seconds: float = 20.0
@@ -49,6 +60,20 @@ class Settings(BaseSettings):
         extra="ignore",
         populate_by_name=True,
     )
+
+    @model_validator(mode="after")
+    def validate_embedding_settings(self) -> "Settings":
+        if self.embedding_provider == "huggingface" and not self.huggingface_api_key:
+            raise ValueError(
+                "HUGGINGFACE_API_KEY is required when EMBEDDING_PROVIDER=huggingface"
+            )
+        return self
+
+    @property
+    def embedding_model(self) -> str:
+        if self.embedding_provider == "huggingface":
+            return "BAAI/bge-small-en-v1.5"
+        return self.gemini_embedding_model
 
     @property
     def allowed_origins(self) -> list[str]:

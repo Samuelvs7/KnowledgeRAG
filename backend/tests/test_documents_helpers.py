@@ -1,11 +1,14 @@
 import json
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 
+from routers import documents
 from routers.documents import (
     _validated_storage_path,
 )
+from services.chunker import DocumentChunk
 from services.streaming import StreamingService
 from services.citations import CitationService
 from services.retrieval.document_retriever import DocumentRetriever
@@ -71,3 +74,56 @@ def test_sse_serializes_named_event():
     assert event.startswith("event: delta\n")
     assert event.endswith("\n\n")
     assert json.loads(event.split("data: ", 1)[1]) == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_marks_failed_when_embedding_generation_fails(monkeypatch):
+    updates: list[tuple[str, dict]] = []
+
+    class FailingEmbeddingProvider:
+        async def embed_text(self, text: str, *, title: str | None = None, is_query: bool = False):
+            raise RuntimeError("Hugging Face embedding request failed with HTTP 503")
+
+    async def fake_download_storage_object(file_path: str, temp_dir: str) -> Path:
+        local_path = Path(temp_dir) / "source.txt"
+        local_path.write_text("hello world", encoding="utf-8")
+        return local_path
+
+    def fake_update_ingestion(document_id: str, status_value: str, **kwargs):
+        updates.append((status_value, kwargs))
+
+    monkeypatch.setattr(
+        documents,
+        "_get_document_for_user",
+        lambda document_id, user_id: {
+            "id": document_id,
+            "file_url": f"{user_id}/source.txt",
+            "file_type": "text/plain",
+            "title": "Source",
+        },
+    )
+    monkeypatch.setattr(documents, "_increment_ingestion_attempt", lambda document_id: None)
+    monkeypatch.setattr(documents, "_download_storage_object", fake_download_storage_object)
+    monkeypatch.setattr(documents, "extract_metadata", lambda local_path, file_type: {})
+    monkeypatch.setattr(documents, "_update_document_metadata", lambda document_id, metadata: None)
+    monkeypatch.setattr(documents, "_collection_ids_for_document", lambda document_id, user_id: [])
+    monkeypatch.setattr(
+        documents,
+        "_build_chunks",
+        lambda *args, **kwargs: [
+            DocumentChunk(content="hello world", chunk_index=0, metadata={"source": "source.txt"})
+        ],
+    )
+    monkeypatch.setattr(documents.ModelRouter, "get_provider", staticmethod(lambda: FailingEmbeddingProvider()))
+    monkeypatch.setattr(documents, "_cleanup_staging", lambda document_id, job_id: None)
+    monkeypatch.setattr(documents, "_update_ingestion", fake_update_ingestion)
+
+    await documents._run_ingestion("doc-1", "user-1", "job-1")
+
+    statuses = [status for status, _ in updates]
+    assert "embedding" in statuses
+    assert "ready" not in statuses
+    assert updates[-1][0] == "failed"
+    assert "Embedding generation failed" in updates[-1][1]["error_message"]
+    assert "HTTP 503" in updates[-1][1]["error_message"]
+    assert updates[-1][1]["completed"] is True

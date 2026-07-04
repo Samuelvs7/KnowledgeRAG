@@ -16,8 +16,3 @@ class OpenAIProvider(BaseProvider):
             raise ValueError("OpenAI API key not configured")
         raise NotImplementedError("OpenAI integration scaffolding only")
         yield ""
-
-    async def embed_text(self, text: str, *, title: str | None = None, is_query: bool = False) -> list[float]:
-        if not settings.openai_api_key:
-            raise ValueError("OpenAI API key not configured")
-        raise NotImplementedError("OpenAI integration scaffolding only")
