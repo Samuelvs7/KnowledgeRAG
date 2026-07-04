@@ -15,74 +15,80 @@ class DocumentRetriever(BaseRetriever):
         match_count = kwargs.get("match_count", 20)
 
         import logging
+        import time
         logger = logging.getLogger(__name__)
 
-        try:
-            # Generate embedding using the abstracted provider
-            query_embedding = await self.provider.embed_text(query, is_query=True)
+        async def _run_vector():
+            t0 = time.perf_counter()
+            try:
+                emb = await self.provider.embed_text(query, is_query=True)
+                res = await asyncio.to_thread(
+                    self._search_scoped, query_text=query, query_embedding=emb, 
+                    user_id=user_id, document_id=document_id, collection_id=collection_id, match_count=match_count
+                )
+                logger.info("[METRIC] Vector Search Time: %.2fms", (time.perf_counter()-t0)*1000)
+                return res
+            except Exception as e:
+                logger.warning(f"Vector search failed: {e}")
+                return []
 
-            # Call the new hybrid RPC
-            matches = await asyncio.to_thread(
-                self._search_scoped,
-                query_text=query,
-                query_embedding=query_embedding,
-                user_id=user_id,
-                document_id=document_id,
-                collection_id=collection_id,
-                match_count=match_count
-            )
+        async def _run_keyword():
+            t0 = time.perf_counter()
+            try:
+                res = await self._search_keyword(query, user_id, document_id, collection_id, match_count)
+                logger.info("[METRIC] Keyword Search Time: %.2fms", (time.perf_counter()-t0)*1000)
+                return res
+            except Exception as e:
+                logger.warning(f"Keyword search failed: {e}")
+                return []
 
-            # Maps matches to ContentChunk schema structure used in the router
-            return [self._content_chunk_from_match(match) for match in matches]
-        except Exception as exc:
-            logger.warning("[FAILSAFE] Generating query embedding failed, falling back to text-only retrieval: %s", str(exc))
-            return await self._fallback_text_retrieve(query, user_id, document_id=document_id, collection_id=collection_id, match_count=match_count)
-
-    async def _fallback_text_retrieve(self, query: str, user_id: str, **kwargs) -> list[ContentChunk]:
-        """Direct table query fallback when embedding fails (keyword-like via ilike or scope filtering)"""
-        document_id = kwargs.get("document_id")
-        limit = kwargs.get("match_count", 20)
+        vector_results, keyword_results = await asyncio.gather(_run_vector(), _run_keyword())
         
-        # Simple query directly against chunks table
+        logger.info(f"[RAG] Vector Results Count: {len(vector_results)}")
+        logger.info(f"[RAG] Keyword Results Count: {len(keyword_results)}")
+
+        # Merge results, remove duplicates
+        merged = {}
+        for m in vector_results:
+            merged[str(m["id"])] = m
+        for m in keyword_results:
+            merged[str(m["id"])] = m
+            
+        logger.info(f"[RAG] Merged Chunks Count: {len(merged)}")
+            
+        return [self._content_chunk_from_match(v) for v in merged.values()]
+
+    async def _search_keyword(self, query: str, user_id: str, document_id: str | None, collection_id: str | None, match_count: int) -> list[dict[str, Any]]:
+        # First resolve allowed doc IDs to enforce strict RLS/scope from Python without complex joins
+        q_docs = supabase.table("documents").select("id").eq("user_id", user_id)
+        if document_id:
+            q_docs = q_docs.eq("id", document_id)
+            
+        docs_resp = await asyncio.to_thread(q_docs.execute)
+        allowed_docs = [str(r["id"]) for r in (docs_resp.data or [])]
+        
+        if collection_id and allowed_docs:
+            q_col = supabase.table("collection_documents").select("document_id").eq("collection_id", collection_id).in_("document_id", allowed_docs)
+            col_resp = await asyncio.to_thread(q_col.execute)
+            allowed_docs = list(set([str(r["document_id"]) for r in (col_resp.data or [])]))
+
+        if not allowed_docs:
+            return []
+            
         def _fetch():
             q = supabase.table("document_chunks")\
-                .select("id, document_id, content, chunk_index, metadata")
-            
-            if document_id:
-                # Scoped to specific document (very common for demo)
-                q = q.eq("document_id", document_id)
-            else:
-                # Global or collection search - naive ilike, demo only fallback
-                # In a real app we'd join with user_id/permissions
-                words = [w for w in query.split() if len(w) > 3][:3]
-                if words:
-                    q = q.ilike("content", f"%{words[0]}%")
-                    
-            return q.limit(limit).execute()
-        
-        response = await asyncio.to_thread(_fetch)
-        data = response.data or []
-        
-        chunks = []
-        for row in data:
-            metadata = row.get("metadata") or {}
-            doc_id = row.get("document_id") or metadata.get("document_id")
-            doc_title = metadata.get("document_title") or "Document"
-            idx = row.get("chunk_index", 0)
-            metadata.update({
-                "document_id": str(doc_id) if doc_id else "",
-                "document_title": doc_title,
-                "chunk_index": idx,
-                "score": 0.5
-            })
-            chunks.append(ContentChunk(
-                id=str(row["id"]),
-                content=str(row.get("content") or ""),
-                similarity=0.5,
-                source=f"{doc_title} - chunk {int(idx) + 1}",
-                metadata=metadata
-            ))
-        return chunks
+                .select("id, document_id, content, chunk_index, metadata")\
+                .in_("document_id", allowed_docs)
+                
+            clean_query = query.strip()
+            if clean_query:
+                # Uses the pre-calculated 'fts' tsvector column with PostgreSQL websearch_to_tsquery
+                q = q.text_search("fts", clean_query, config={"type": "websearch", "config": "english"})
+                
+            return q.limit(match_count).execute()
+
+        res = await asyncio.to_thread(_fetch)
+        return res.data or []
 
     def _search_scoped(self, query_text: str, query_embedding: list[float], user_id: str, **kwargs) -> list[dict[str, Any]]:
         document_id = kwargs.get("document_id")
@@ -90,9 +96,8 @@ class DocumentRetriever(BaseRetriever):
         match_count = kwargs.get("match_count", 20)
 
         response = supabase.rpc(
-            "match_documents_hybrid",
+            "match_documents_scoped",
             {
-                "query_text": query_text,
                 "query_embedding": query_embedding,
                 "p_user_id": user_id,
                 "p_document_id": document_id,
@@ -126,12 +131,12 @@ class DocumentRetriever(BaseRetriever):
             "chunk_index": chunk_index,
             "collection_id": match.get("collection_id") or metadata.get("collection_id"),
             "collection_name": collection_name,
-            "score": match.get("score"), # Storing the RRF score
+            "score": match.get("score") or match.get("similarity"),
         })
         return ContentChunk(
             id=str(match["id"]),
             content=str(match.get("content") or ""),
-            similarity=float(match.get("score") or 0), # Override similarity with RRF score for now
+            similarity=float(match.get("score") or match.get("similarity") or 0.0),
             source=" - ".join(source_parts),
             metadata=metadata,
         )

@@ -85,7 +85,7 @@ async def query_documents(
         session_id = await asyncio.to_thread(MemoryService.create_session, user.id, "document_rag", f"Query: {req.query[:30]}...")
         
     await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
-    response_dict = await AgentRegistry.execute("document_rag", req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text)
+    response_dict = await AgentRegistry.execute("document_rag", req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text, session_id=session_id)
     
     answer = response_dict["answer"]
     diagnostics = response_dict["diagnostics"]
@@ -110,7 +110,7 @@ async def stream_query_documents(
 
     async def events() -> AsyncIterator[str]:
         try:
-            diagnostics, generator, context_chunks = await AgentRegistry.stream("document_rag", req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text)
+            diagnostics, generator, context_chunks = await AgentRegistry.stream("document_rag", req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text, session_id=session_id)
             yield _sse("context", {"diagnostics": _model_dump(diagnostics), "session_id": session_id})
             
             llm_start = time.perf_counter()
