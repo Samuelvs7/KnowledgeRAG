@@ -1,4 +1,4 @@
-# Paste your .gitignore content here
+# ---- Node / frontend ----
 logs
 *.log
 npm-debug.log*
@@ -12,13 +12,49 @@ dist
 dist-ssr
 *.local
 
+# ---- Editors / OS ----
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+Thumbs.db
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# ---- Secrets ----
 .env
+.env.*
+!.env.example
+
+# ---- Python / backend ----
+venv/
+.venv/
+backend/venv/
+backend/.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyd
+
+# ---- Large binaries / installers (never commit these) ----
+*.zip
+*.exe
+*.dll
+*.7z
+*.iso
+ollama.zip
+OllamaSetup.exe
+
+# ---- Misc ----
+*.tmp
+.cache/

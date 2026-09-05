@@ -6,26 +6,29 @@ import { AIDiagnosticsPanel, ContextChunksPanel, IngestionStatusBadge } from '..
 import type {
   AIQuery,
   AIDiagnostics,
+  AISession,
+  AIMessage,
   CollectionDocument,
   ContextChunk,
   Document,
   DocumentCollection,
   DocumentIngestion,
 } from '../types';
+import { WorkspaceOverviewDrawer } from '../components/WorkspaceOverviewDrawer';
+import { ChatHistorySidebar } from '../components/chat/ChatHistorySidebar';
 import {
-  Bot,
+  AlertTriangle,
+  BarChart3,
   CheckCircle,
   Clock,
-  Database,
   FileSearch,
   FileText,
   FolderOpen,
   Gauge,
-  HardDrive,
   Inbox,
-  Layers,
   Loader2,
   MessageSquare,
+  MessageSquareText,
   MoreHorizontal,
   Plus,
   Search,
@@ -59,6 +62,8 @@ interface BackendHealth {
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+const SESSIONS_STORAGE_KEY = 'knowledgerag_current_session';
+const PINNED_STORAGE_KEY = 'knowledgerag_pinned_sessions';
 
 const ACCEPTED_FILE_TYPES = [
   '.pdf',
@@ -96,6 +101,7 @@ export function DocumentsPage() {
   const [aiMode, setAIMode] = useState<AIMode>('all');
   const [modeDocumentId, setModeDocumentId] = useState('');
   const [modeCollectionId, setModeCollectionId] = useState('');
+  const [savedDocTitle, setSavedDocTitle] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState<SortKey>('updated');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -105,9 +111,23 @@ export function DocumentsPage() {
   const [uploading, setUploading] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
+  const [showOverviewDrawer, setShowOverviewDrawer] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [diagnostics, setDiagnostics] = useState<AIDiagnostics | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // === Chat History State ===
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(
+    () => localStorage.getItem(SESSIONS_STORAGE_KEY)
+  );
+  const [sessions, setSessions] = useState<AISession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem(PINNED_STORAGE_KEY);
+      return stored ? new Set(JSON.parse(stored) as string[]) : new Set<string>();
+    } catch { return new Set<string>(); }
+  });
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -116,6 +136,7 @@ export function DocumentsPage() {
   useEffect(() => {
     if (user) {
       void fetchData();
+      void fetchSessions();
     } else {
       setLoading(false);
     }
@@ -130,6 +151,29 @@ export function DocumentsPage() {
   useEffect(() => () => {
     queryAbortRef.current?.abort();
   }, []);
+
+  // Persist currentSessionId to localStorage
+  useEffect(() => {
+    if (currentSessionId) {
+      localStorage.setItem(SESSIONS_STORAGE_KEY, currentSessionId);
+    } else {
+      localStorage.removeItem(SESSIONS_STORAGE_KEY);
+    }
+  }, [currentSessionId]);
+
+  // Persist pinned IDs to localStorage
+  useEffect(() => {
+    localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify([...pinnedIds]));
+  }, [pinnedIds]);
+
+  // Restore last conversation on mount
+  useEffect(() => {
+    if (!user || !session?.access_token) return;
+    const savedSessionId = localStorage.getItem(SESSIONS_STORAGE_KEY);
+    if (savedSessionId && messages.length === 0 && !processing) {
+      void restoreSession(savedSessionId);
+    }
+  }, [user, session?.access_token]);
 
   const documentsById = useMemo(() => new Map(documents.map(doc => [doc.id, doc])), [documents]);
 
@@ -203,6 +247,214 @@ export function DocumentsPage() {
   const storageUsed = documents.reduce((sum, doc) => sum + (doc.file_size || 0), 0);
   const todayQueries = queryLogs.filter(log => isToday(log.created_at)).length;
   const lastCitations = diagnostics?.contextChunks || (queryLogs[0]?.context_chunks as ContextChunk[] | undefined) || [];
+
+  const fetchSessions = async () => {
+    if (!session?.access_token) return;
+    setSessionsLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/sessions?module_type=document_rag&limit=50`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setSessions(data.sessions || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch sessions:', err);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const applySessionScope = (sess: AISession, docsList = documents, colsList = collections) => {
+    const meta = (sess.metadata || {}) as Record<string, unknown>;
+    const rawType = sess.scope_type || (meta.scope_type as string) || 'all';
+    const docId = (sess.scope_document_id || (meta.scope_document_id as string) || '') as string;
+    const colId = (sess.scope_collection_id || (meta.scope_collection_id as string) || '') as string;
+    const docTitle = (sess.scope_document_title || (meta.scope_document_title as string) || '') as string;
+
+    setSavedDocTitle(docTitle);
+
+    if (rawType === 'single_document' || rawType === 'document') {
+      setAIMode('document');
+      setModeDocumentId(docId);
+      const docMatch = docsList.find(d => d.id === docId);
+      setSelectedDocument(docMatch || null);
+      setSelectedCollection(null);
+      setModeCollectionId('');
+    } else if (rawType === 'collection') {
+      setAIMode('collection');
+      setModeCollectionId(colId);
+      const colMatch = colsList.find(c => c.id === colId);
+      setSelectedCollection(colMatch || null);
+      setSelectedDocument(null);
+      setModeDocumentId('');
+    } else {
+      setAIMode('all');
+      setModeDocumentId('');
+      setModeCollectionId('');
+      setSelectedDocument(null);
+      setSelectedCollection(null);
+    }
+  };
+
+  const restoreSession = async (sessionId: string) => {
+    if (!session?.access_token) return;
+    try {
+      const [sessRes, msgsRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }),
+        fetch(`${API_BASE_URL}/api/sessions/${sessionId}/messages?limit=100`, {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }),
+      ]);
+
+      if (!sessRes.ok || !msgsRes.ok) {
+        localStorage.removeItem(SESSIONS_STORAGE_KEY);
+        return;
+      }
+
+      const sessionData: AISession = await sessRes.json();
+      const msgsData = await msgsRes.json();
+      const restoredMessages: Message[] = (msgsData.messages || []).map((msg: AIMessage) => ({
+        id: msg.id,
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+        citations: (msg.citations_json as unknown) as ContextChunk[] | undefined,
+        createdAt: msg.created_at,
+      }));
+
+      if (restoredMessages.length > 0) {
+        setMessages(restoredMessages);
+        setCurrentSessionId(sessionId);
+        applySessionScope(sessionData);
+      }
+    } catch (err) {
+      console.error('Failed to restore session:', err);
+    }
+  };
+
+  const handleNewChat = () => {
+    setCurrentSessionId(null);
+    setMessages([]);
+    setDiagnostics(null);
+    setQuery('');
+    setAIMode('all');
+    setModeDocumentId('');
+    setModeCollectionId('');
+    setSelectedDocument(null);
+    setSelectedCollection(null);
+    setSavedDocTitle('');
+    setActiveView('dashboard');
+    localStorage.removeItem(SESSIONS_STORAGE_KEY);
+    // Focus input after render
+    setTimeout(() => {
+      const input = document.querySelector<HTMLInputElement>('form input[type="text"], form input:not([type])');
+      input?.focus();
+    }, 100);
+  };
+
+  const resumeSession = async (sessionToResume: AISession) => {
+    if (!session?.access_token) return;
+    setMessages([]);
+    setDiagnostics(null);
+    setCurrentSessionId(sessionToResume.id);
+    localStorage.setItem(SESSIONS_STORAGE_KEY, sessionToResume.id);
+    setActiveView('dashboard');
+
+    applySessionScope(sessionToResume);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/sessions/${sessionToResume.id}/messages?limit=100`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!response.ok) throw new Error('Failed to load messages');
+      const data = await response.json();
+      const loadedMessages: Message[] = (data.messages || []).map((msg: AIMessage) => ({
+        id: msg.id,
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+        citations: (msg.citations_json as unknown) as ContextChunk[] | undefined,
+        createdAt: msg.created_at,
+      }));
+      setMessages(loadedMessages);
+    } catch (err) {
+      console.error('Failed to resume session:', err);
+      setError('Could not load conversation history.');
+    }
+  };
+
+  const persistScopeToActiveSession = async (
+    sessionId: string | null,
+    mode: AIMode,
+    docId?: string,
+    colId?: string,
+    docTitle?: string
+  ) => {
+    if (!session?.access_token || !sessionId) return;
+    const scopeType = mode === 'document' ? 'single_document' : (mode === 'collection' ? 'collection' : 'all');
+    try {
+      await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
+        method: 'PATCH',
+        headers: authorizedJsonHeaders(),
+        body: JSON.stringify({
+          scope_type: scopeType,
+          scope_document_id: mode === 'document' ? docId || null : null,
+          scope_collection_id: mode === 'collection' ? colId || null : null,
+          scope_document_title: mode === 'document' ? docTitle || null : null,
+        }),
+      });
+      setSessions(prev => prev.map(s => s.id === sessionId ? {
+        ...s,
+        scope_type: scopeType,
+        scope_document_id: mode === 'document' ? docId || null : null,
+        scope_collection_id: mode === 'collection' ? colId || null : null,
+        scope_document_title: mode === 'document' ? docTitle || null : null,
+      } : s));
+    } catch (err) {
+      console.error('Failed to persist session scope update:', err);
+    }
+  };
+
+  const renameSession = async (sessionId: string, newTitle: string) => {
+    if (!session?.access_token) return;
+    try {
+      await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
+        method: 'PATCH',
+        headers: authorizedJsonHeaders(),
+        body: JSON.stringify({ title: newTitle }),
+      });
+      setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: newTitle } : s));
+    } catch (err) {
+      console.error('Failed to rename session:', err);
+    }
+  };
+
+  const deleteSession = async (sessionId: string) => {
+    if (!session?.access_token) return;
+    try {
+      await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (currentSessionId === sessionId) {
+        handleNewChat();
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  };
+
+  const pinSession = (sessionId: string) => {
+    setPinnedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  };
 
   const fetchData = async () => {
     setLoading(true);
@@ -522,6 +774,7 @@ export function DocumentsPage() {
         signal: controller.signal,
         body: JSON.stringify({
           query: userMessage.content,
+          session_id: currentSessionId || undefined,
           scope: {
             mode: aiMode,
             document_id: aiMode === 'document' ? modeDocumentId || selectedDocument?.id : null,
@@ -567,6 +820,10 @@ export function DocumentsPage() {
           finalCitations = nextDiagnostics.contextChunks || [];
           setDiagnostics(nextDiagnostics);
           updateAssistantMessage(assistantContent, finalCitations);
+          // Capture session_id from backend
+          if (payload.session_id && !currentSessionId) {
+            setCurrentSessionId(payload.session_id as string);
+          }
         } else if (eventName === 'delta') {
           assistantContent += payload.text || '';
           updateAssistantMessage(assistantContent, finalCitations);
@@ -576,6 +833,10 @@ export function DocumentsPage() {
           assistantContent = payload.answer || assistantContent;
           setDiagnostics(nextDiagnostics);
           updateAssistantMessage(assistantContent, finalCitations);
+          // Capture session_id from done event
+          if (payload.session_id && !currentSessionId) {
+            setCurrentSessionId(payload.session_id as string);
+          }
         } else if (eventName === 'error') {
           throw new Error(payload.message || 'Document query stream failed.');
         }
@@ -593,6 +854,7 @@ export function DocumentsPage() {
         handleStreamEvent(buffer);
       }
       void fetchData();
+      void fetchSessions();
     } catch (err) {
       console.error('Query error:', err);
       setDiagnostics({
@@ -627,9 +889,18 @@ export function DocumentsPage() {
     { id: 'dashboard', label: 'Dashboard', icon: Gauge, active: activeView === 'dashboard', onClick: () => setActiveView('dashboard') },
     { id: 'documents', label: 'My Documents', icon: FileText, active: activeView === 'documents' || activeView === 'details', onClick: () => setActiveView('documents'), badge: documents.length },
     { id: 'collections', label: 'Collections', icon: FolderOpen, active: activeView === 'collections' || activeView === 'collection-workspace', onClick: () => setActiveView('collections'), badge: collections.length },
-    { id: 'recent', label: 'Recent Queries', icon: Clock, active: activeView === 'recent', onClick: () => setActiveView('recent') },
+    { id: 'recent', label: 'Chat History', icon: MessageSquareText, active: activeView === 'recent', onClick: () => { setActiveView('recent'); void fetchSessions(); }, badge: sessions.length || undefined },
     { id: 'citations', label: 'Citations', icon: FileSearch, active: activeView === 'citations', onClick: () => setActiveView('citations'), badge: lastCitations.length || undefined },
     { id: 'settings', label: 'Settings', icon: Settings, active: activeView === 'settings', onClick: () => setActiveView('settings') },
+  ];
+
+  const bottomSidebarItems: SidebarItem[] = [
+    {
+      id: 'overview',
+      label: 'Workspace Overview',
+      icon: BarChart3,
+      onClick: () => setShowOverviewDrawer(true),
+    },
   ];
 
   if (!user) {
@@ -656,6 +927,7 @@ export function DocumentsPage() {
       icon={FileText}
       accentColor="bg-blue-500"
       sidebarItems={sidebarItems}
+      bottomSidebarItems={bottomSidebarItems}
     >
       <div className="h-14 bg-slate-950 border-b border-slate-800 flex items-center justify-between px-5">
         <div className="flex items-center gap-3">
@@ -682,6 +954,30 @@ export function DocumentsPage() {
       </div>
 
       {renderActiveView()}
+
+      {/* Workspace Overview Drawer */}
+      <WorkspaceOverviewDrawer
+        isOpen={showOverviewDrawer}
+        onClose={() => setShowOverviewDrawer(false)}
+        metrics={{
+          documentsCount: documents.length,
+          collectionsCount: collections.length,
+          totalChunks,
+          totalEmbeddings,
+          readyDocs,
+          storageUsedFormatted: formatBytes(storageUsed),
+          todayQueries,
+          activeModel: health?.model || 'Unknown',
+        }}
+        activity={{
+          documents,
+          collections,
+          queryLogs,
+          onOpenDocument: openDocumentWorkspace,
+          onOpenCollection: openCollectionWorkspace,
+          onViewAllQueries: () => setActiveView('recent'),
+        }}
+      />
 
       {showUpload && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
@@ -748,42 +1044,13 @@ export function DocumentsPage() {
 
   function renderDashboard() {
     return (
-      <div className="flex-1 grid grid-cols-[minmax(0,1fr)_360px] overflow-hidden">
-        <main className="overflow-y-auto">
+      <div className="flex-1 grid grid-cols-[minmax(0,1fr)_360px] overflow-hidden h-full">
+        <main className="flex flex-col h-full overflow-hidden">
           {renderAIWorkspace({
             title: 'Ask anything from your documents',
             subtitle: 'Search all indexed files unless you switch scope.',
             placeholder: 'Ask anything from your documents...',
           })}
-
-          <section className="border-t border-slate-800 p-5">
-            <div className="grid grid-cols-4 gap-4">
-              {[
-                { label: 'Documents', value: documents.length.toLocaleString(), icon: FileText, tone: 'text-blue-400' },
-                { label: 'Collections', value: collections.length.toLocaleString(), icon: FolderOpen, tone: 'text-violet-400' },
-                { label: 'Chunks', value: totalChunks.toLocaleString(), icon: Layers, tone: 'text-cyan-400' },
-                { label: 'Embeddings', value: totalEmbeddings.toLocaleString(), icon: Database, tone: 'text-emerald-400' },
-                { label: 'Indexed Files', value: readyDocs.toLocaleString(), icon: CheckCircle, tone: 'text-green-400' },
-                { label: 'Storage Used', value: formatBytes(storageUsed), icon: HardDrive, tone: 'text-amber-400' },
-                { label: 'Queries Today', value: todayQueries.toLocaleString(), icon: MessageSquare, tone: 'text-pink-400' },
-                { label: 'Active AI Model', value: health?.model || 'Unknown', icon: Bot, tone: 'text-blue-300' },
-              ].map(item => (
-                <div key={item.label} className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-                  <div className="mb-3 flex items-center justify-between">
-                    <item.icon className={`h-5 w-5 ${item.tone}`} />
-                    <span className="text-xs text-slate-600">{item.label}</span>
-                  </div>
-                  <div className="truncate text-2xl font-semibold text-white">{item.value}</div>
-                </div>
-              ))}
-            </div>
-
-            <div className="mt-5 grid grid-cols-3 gap-4">
-              {renderRecentDocumentsCard()}
-              {renderRecentCollectionsCard()}
-              {renderRecentConversationsCard()}
-            </div>
-          </section>
         </main>
         {renderPipelinePanel()}
       </div>
@@ -792,7 +1059,7 @@ export function DocumentsPage() {
 
   function renderAIWorkspace({ title, subtitle, placeholder }: { title: string; subtitle: string; placeholder: string }) {
     return (
-      <section className="flex min-h-[520px] flex-col bg-slate-900">
+      <section className="flex flex-col h-full overflow-hidden bg-slate-900">
         <div className="border-b border-slate-800 px-5 py-4">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -802,7 +1069,14 @@ export function DocumentsPage() {
             <div className="flex items-center gap-2">
               <select
                 value={aiMode}
-                onChange={event => setAIMode(event.target.value as AIMode)}
+                onChange={event => {
+                  const newMode = event.target.value as AIMode;
+                  setAIMode(newMode);
+                  if (currentSessionId) {
+                    const doc = documents.find(d => d.id === modeDocumentId);
+                    void persistScopeToActiveSession(currentSessionId, newMode, modeDocumentId, modeCollectionId, doc?.title || savedDocTitle);
+                  }
+                }}
                 className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 <option value="all">All Documents</option>
@@ -812,7 +1086,13 @@ export function DocumentsPage() {
               {aiMode === 'collection' && (
                 <select
                   value={modeCollectionId}
-                  onChange={event => setModeCollectionId(event.target.value)}
+                  onChange={event => {
+                    const colId = event.target.value;
+                    setModeCollectionId(colId);
+                    if (currentSessionId) {
+                      void persistScopeToActiveSession(currentSessionId, 'collection', undefined, colId, undefined);
+                    }
+                  }}
                   className="max-w-52 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
                   <option value="">Select collection</option>
@@ -824,10 +1104,24 @@ export function DocumentsPage() {
               {aiMode === 'document' && (
                 <select
                   value={modeDocumentId}
-                  onChange={event => setModeDocumentId(event.target.value)}
+                  onChange={event => {
+                    const docId = event.target.value;
+                    setModeDocumentId(docId);
+                    const found = documents.find(d => d.id === docId);
+                    setSelectedDocument(found || null);
+                    if (found?.title) setSavedDocTitle(found.title);
+                    if (currentSessionId) {
+                      void persistScopeToActiveSession(currentSessionId, 'document', docId, undefined, found?.title || savedDocTitle);
+                    }
+                  }}
                   className="max-w-56 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
                   <option value="">Select document</option>
+                  {modeDocumentId && !documents.some(doc => doc.id === modeDocumentId) && (
+                    <option value={modeDocumentId} disabled className="text-amber-400 font-medium">
+                      {savedDocTitle ? `${savedDocTitle} (Unavailable)` : 'Document Unavailable'}
+                    </option>
+                  )}
                   {documents.map(doc => (
                     <option key={doc.id} value={doc.id}>{doc.title}</option>
                   ))}
@@ -836,6 +1130,15 @@ export function DocumentsPage() {
             </div>
           </div>
         </div>
+
+        {aiMode === 'document' && modeDocumentId && !documents.some(doc => doc.id === modeDocumentId) && (
+          <div className="mx-5 mt-3 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-300">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+            <span>
+              The referenced document (<strong>{savedDocTitle || 'Document'}</strong>) is unavailable or has been deleted. Please select an available document to ask new questions.
+            </span>
+          </div>
+        )}
 
         <div ref={chatContainerRef} className="flex-1 overflow-y-auto p-5">
           {messages.length === 0 ? (
@@ -1167,28 +1470,19 @@ export function DocumentsPage() {
 
   function renderRecentQueries() {
     return (
-      <div className="flex-1 grid grid-cols-[minmax(0,1fr)_360px] overflow-hidden">
-        <main className="overflow-y-auto p-5">
-          <h2 className="text-xl font-semibold text-white">Recent AI Conversations</h2>
-          <div className="mt-4 overflow-hidden rounded-xl border border-slate-800 bg-slate-900">
-            {queryLogs.length === 0 ? (
-              <div className="py-14 text-center text-sm text-slate-500">No document conversations yet.</div>
-            ) : queryLogs.map(log => (
-              <div key={log.id} className="border-b border-slate-800 p-4 last:border-b-0">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-white">{log.query_text}</div>
-                    <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
-                      <span>{shortDate(log.created_at)}</span>
-                      {log.response_time_ms && <span>{log.response_time_ms}ms</span>}
-                      {log.confidence_score && <span>{(log.confidence_score * 100).toFixed(0)}% confidence</span>}
-                    </div>
-                  </div>
-                  <span className={`h-2 w-2 rounded-full ${log.status === 'completed' ? 'bg-emerald-500' : log.status === 'failed' ? 'bg-red-500' : 'bg-amber-500'}`} />
-                </div>
-              </div>
-            ))}
-          </div>
+      <div className="flex-1 grid grid-cols-[minmax(0,1fr)_360px] overflow-hidden h-full">
+        <main className="relative flex h-full flex-col overflow-hidden">
+          <ChatHistorySidebar
+            sessions={sessions}
+            activeSessionId={currentSessionId}
+            pinnedIds={pinnedIds}
+            loading={sessionsLoading}
+            onNewChat={handleNewChat}
+            onSelectSession={resumeSession}
+            onRenameSession={renameSession}
+            onDeleteSession={deleteSession}
+            onPinSession={pinSession}
+          />
         </main>
         {renderPipelinePanel()}
       </div>
@@ -1289,57 +1583,6 @@ export function DocumentsPage() {
           )}
         </div>
       </aside>
-    );
-  }
-
-  function renderRecentDocumentsCard() {
-    return (
-      <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <h3 className="mb-3 text-sm font-semibold text-white">Recent Documents</h3>
-        <div className="space-y-2">
-          {documents.slice(0, 5).map(doc => (
-            <button key={doc.id} onClick={() => openDocumentWorkspace(doc)} className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-slate-800">
-              <FileText className="h-4 w-4 text-blue-400" />
-              <span className="min-w-0 flex-1 truncate text-sm text-slate-300">{doc.title}</span>
-            </button>
-          ))}
-          {documents.length === 0 && <p className="text-sm text-slate-500">No documents yet</p>}
-        </div>
-      </div>
-    );
-  }
-
-  function renderRecentCollectionsCard() {
-    return (
-      <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <h3 className="mb-3 text-sm font-semibold text-white">Recent Collections</h3>
-        <div className="space-y-2">
-          {collections.slice(0, 5).map(collection => (
-            <button key={collection.id} onClick={() => openCollectionWorkspace(collection)} className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left hover:bg-slate-800">
-              <FolderOpen className="h-4 w-4 text-violet-400" />
-              <span className="min-w-0 flex-1 truncate text-sm text-slate-300">{collection.name}</span>
-            </button>
-          ))}
-          {collections.length === 0 && <p className="text-sm text-slate-500">No collections yet</p>}
-        </div>
-      </div>
-    );
-  }
-
-  function renderRecentConversationsCard() {
-    return (
-      <div className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <h3 className="mb-3 text-sm font-semibold text-white">Recent AI Conversations</h3>
-        <div className="space-y-2">
-          {queryLogs.slice(0, 5).map(log => (
-            <div key={log.id} className="rounded-lg px-2 py-2">
-              <div className="truncate text-sm text-slate-300">{log.query_text}</div>
-              <div className="mt-1 text-xs text-slate-600">{shortDate(log.created_at)}</div>
-            </div>
-          ))}
-          {queryLogs.length === 0 && <p className="text-sm text-slate-500">No conversations yet</p>}
-        </div>
-      </div>
     );
   }
 }

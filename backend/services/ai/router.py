@@ -33,6 +33,8 @@ class ModelRouter:
                 # Based on LLM_PROVIDER setting
                 if settings.llm_provider.lower() == "groq":
                     provider = GroqProvider()
+                elif settings.llm_provider.lower() == "ollama":
+                    provider = OllamaProvider()
                 else:
                     provider = GeminiProvider()
 

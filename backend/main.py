@@ -14,7 +14,7 @@ from logging_config import configure_logging
 
 configure_logging()
 
-from routers import documents, products, sessions, search, platform
+from routers import documents, products, sessions, search, platform, codebase, quiz, learning
 from middleware import RequestIdMiddleware, MetricsMiddleware
 from services.plugin_manager import PluginManager
 
@@ -51,6 +51,9 @@ app.include_router(products.router)
 app.include_router(sessions.router)
 app.include_router(search.router)
 app.include_router(platform.router)
+app.include_router(codebase.router)
+app.include_router(quiz.router)
+app.include_router(learning.router)
 
 
 def _package_version(package_name: str) -> str:

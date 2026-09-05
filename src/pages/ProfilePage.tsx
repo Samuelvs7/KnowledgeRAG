@@ -5,22 +5,14 @@ import {
   User,
   Mail,
   Lock,
-  LogOut,
   Loader2,
-  UserCircle,
-  BarChart3,
-  History,
-  Heart,
-  Settings,
-  Shield,
-  Database,
   ArrowLeft,
   Brain
 } from 'lucide-react';
 
 export function ProfilePage() {
   const navigate = useNavigate();
-  const { user, profile, loading, signUp, signIn, signOut, updateProfile } = useAuth();
+  const { user, loading, signUp, signIn } = useAuth();
   const [isLogin, setIsLogin] = useState(true);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -28,10 +20,6 @@ export function ProfilePage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-
-  const [editingProfile, setEditingProfile] = useState(false);
-  const [editName, setEditName] = useState('');
-  const [updatingProfile, setUpdatingProfile] = useState(false);
 
   // Auto redirect to main app if they just signed up/in and were dropped here
   useEffect(() => {
@@ -65,19 +53,6 @@ export function ProfilePage() {
         setPassword('');
       }
       setSubmitting(false);
-    }
-  };
-
-  const handleUpdateProfile = async () => {
-    setUpdatingProfile(true);
-    try {
-      const { error } = await updateProfile({ full_name: editName });
-      if (error) throw error;
-      setEditingProfile(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update profile');
-    } finally {
-      setUpdatingProfile(false);
     }
   };
 

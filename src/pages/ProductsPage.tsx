@@ -214,7 +214,7 @@ export function ProductsPage() {
   return (
     <WorkspaceLayout
       title="StockQuery AI"
-      subtitle="Inventory Intelligence"
+      subtitle="Tool-Using AI Agent"
       icon={Package}
       accentColor="bg-emerald-500"
       sidebarItems={sidebarItems}

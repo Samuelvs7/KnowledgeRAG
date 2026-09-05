@@ -16,6 +16,10 @@ class CreateSessionRequest(BaseModel):
     module_type: str = "document_rag"
     title: str = "New Conversation"
     metadata: dict[str, Any] | None = None
+    scope_type: str | None = None
+    scope_document_id: str | None = None
+    scope_collection_id: str | None = None
+    scope_document_title: str | None = None
 
 
 class AddMessageRequest(BaseModel):
@@ -35,6 +39,10 @@ async def create_session(
         req.module_type,
         req.title,
         req.metadata,
+        scope_type=req.scope_type,
+        scope_document_id=req.scope_document_id,
+        scope_collection_id=req.scope_collection_id,
+        scope_document_title=req.scope_document_title,
     )
     return {"session_id": session_id}
 
@@ -45,15 +53,13 @@ async def list_sessions(
     limit: int = 50,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    from database import supabase
-
-    query = supabase.table("ai_sessions").select("*").eq("user_id", user.id)
-    if module_type:
-        query = query.eq("module_type", module_type)
-    response = await asyncio.to_thread(
-        lambda: query.order("updated_at", desc=True).limit(limit).execute()
+    sessions = await asyncio.to_thread(
+        MemoryService.list_sessions,
+        user.id,
+        module_type,
+        limit,
     )
-    return {"sessions": response.data or []}
+    return {"sessions": sessions}
 
 
 @router.get("/{session_id}")
@@ -118,24 +124,38 @@ async def delete_session(
     return {"status": "deleted"}
 
 
+class UpdateSessionRequest(BaseModel):
+    title: str | None = None
+    scope_type: str | None = None
+    scope_document_id: str | None = None
+    scope_collection_id: str | None = None
+    scope_document_title: str | None = None
+
+
 @router.patch("/{session_id}")
 async def update_session(
     session_id: str,
-    title: str | None = None,
+    req: UpdateSessionRequest,
     user: AuthenticatedUser = Depends(get_current_user),
 ):
-    from database import supabase
-
     session = await asyncio.to_thread(MemoryService.get_session, session_id, user.id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    updates: dict[str, Any] = {}
-    if title is not None:
-        updates["title"] = title
-
-    if updates:
+    if req.title is not None:
+        from database import supabase
         await asyncio.to_thread(
-            lambda: supabase.table("ai_sessions").update(updates).eq("id", session_id).execute()
+            lambda: supabase.table("ai_sessions").update({"title": req.title}).eq("id", session_id).execute()
         )
+
+    if req.scope_type is not None:
+        await asyncio.to_thread(
+            MemoryService.update_session_scope,
+            session_id,
+            req.scope_type,
+            req.scope_document_id,
+            req.scope_collection_id,
+            req.scope_document_title,
+        )
+
     return {"status": "updated"}

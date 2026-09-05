@@ -15,7 +15,14 @@ LLM_MODEL_NAME = settings.llm_model
 
 def run_inventory_agent(query: str, user_id: str) -> dict[str, Any]:
     """Execute verified inventory tools and synthesize an answer from their outputs."""
+    from services.intent_classifier import IntentClassifier
+
     total_start = time.perf_counter()
+    classification = IntentClassifier.classify(query)
+    intent = classification["intent"]
+    requires_retrieval = classification["requires_retrieval"]
+    intent_time_ms = classification["classification_time_ms"]
+
     metrics: dict[str, Any] = {
         "embedding_generated": False,
         "embedding_time_ms": 0,
@@ -26,6 +33,41 @@ def run_inventory_agent(query: str, user_id: str) -> dict[str, Any]:
 
     tool_calls: list[dict[str, Any]] = []
     context_chunks: list[dict[str, Any]] = []
+
+    if not requires_retrieval:
+        # General chat or greeting - skip tool calls and embedding/vector search
+        answer = (
+            "Hello! I'm your AI Inventory Assistant for StockQuery AI.\n\n"
+            "I can help you with:\n"
+            "• Inventory & Stock Tracking\n"
+            "• Product Search & Details\n"
+            "• Warehouse & Storage Facilities\n"
+            "• Supplier Relations & Vendor Details\n"
+            "• Purchase Orders & Procurement\n"
+            "• Forecasting & Business Analytics\n\n"
+            "How can I help you today?"
+        )
+        total_time_ms = max(1, int((time.perf_counter() - total_start) * 1000))
+        diagnostics = {
+            "intent": intent,
+            "intentClassificationTimeMs": intent_time_ms,
+            "embeddingGenerated": False,
+            "embeddingModel": None,
+            "embeddingDimensions": None,
+            "embeddingTimeMs": 0,
+            "vectorSearchPerformed": False,
+            "vectorSearchResults": 0,
+            "vectorSearchTimeMs": 0,
+            "rerankerUsed": False,
+            "rerankerTimeMs": 0,
+            "llmPromptTokens": len(query.split()),
+            "llmCompletionTokens": len(answer.split()),
+            "llmTimeMs": total_time_ms - intent_time_ms,
+            "totalTimeMs": total_time_ms,
+            "contextChunks": [],
+            "toolCalls": [],
+        }
+        return {"answer": answer, "diagnostics": diagnostics}
 
     for tool_name, tool_input in _select_tools(query, user_id):
         tool_call = _execute_tool(tool_name, tool_input, metrics)
@@ -42,9 +84,11 @@ def run_inventory_agent(query: str, user_id: str) -> dict[str, Any]:
     confidence = min(0.99, 0.55 + (successful_tools * 0.1) + (0.15 if context_chunks else 0))
 
     diagnostics = {
+        "intent": intent,
+        "intentClassificationTimeMs": intent_time_ms,
         "embeddingGenerated": metrics["embedding_generated"],
-        "embeddingModel": EMBEDDING_MODEL_NAME,
-        "embeddingDimensions": 768,
+        "embeddingModel": EMBEDDING_MODEL_NAME if metrics["embedding_generated"] else None,
+        "embeddingDimensions": 768 if metrics["embedding_generated"] else None,
         "embeddingTimeMs": metrics["embedding_time_ms"],
         "vectorSearchPerformed": metrics["vector_search_performed"],
         "vectorSearchResults": metrics["vector_search_results"],

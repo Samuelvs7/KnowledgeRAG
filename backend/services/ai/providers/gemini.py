@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import queue
+import random
 import threading
+import time
 import traceback
 from collections.abc import AsyncIterator
 from importlib.metadata import PackageNotFoundError, version
@@ -12,7 +14,7 @@ from google.genai import types
 
 from config import settings
 from services.ai.providers.base import BaseProvider, LLMResult
-from services.retry import with_retry
+from services.retry import is_transient_error, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +61,30 @@ class GeminiProvider(BaseProvider):
         events: queue.Queue[tuple[str, str | Exception | None]] = queue.Queue()
 
         def worker() -> None:
-            try:
-                stream = self._generate_stream(prompt, system_instruction)
-                for event in stream:
-                    delta = self._event_text(event)
-                    if delta:
-                        events.put(("delta", delta))
-                events.put(("done", None))
-            except Exception as exc:
-                events.put(("error", exc))
+            attempts = max(1, settings.max_retry_attempts)
+            for attempt in range(1, attempts + 1):
+                produced = False
+                try:
+                    stream = self._generate_stream(prompt, system_instruction)
+                    for event in stream:
+                        delta = self._event_text(event)
+                        if delta:
+                            produced = True
+                            events.put(("delta", delta))
+                    events.put(("done", None))
+                    return
+                except Exception as exc:
+                    # Only retry when the failure happened before any text was emitted;
+                    # retrying mid-stream would duplicate the already-sent output.
+                    if produced or attempt >= attempts or not is_transient_error(exc):
+                        events.put(("error", exc))
+                        return
+                    delay = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+                    logger.warning(
+                        "[GEMINI] stream attempt %d/%d failed (%s); retrying in %.1fs",
+                        attempt, attempts, exc, delay,
+                    )
+                    time.sleep(delay)
 
         thread = threading.Thread(target=worker, name="gemini-stream", daemon=True)
         thread.start()

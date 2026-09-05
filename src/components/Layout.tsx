@@ -17,10 +17,10 @@ import {
 
 const navItems = [
   { to: '/', label: 'Home', icon: Sparkles },
-  { to: '/documents', label: 'Documents', icon: FileText },
-  { to: '/products', label: 'Products', icon: Package },
-  { to: '/codebase', label: 'Codebase', icon: Code2 },
-  { to: '/learning', label: 'Learning', icon: GraduationCap },
+  { to: '/documents', label: 'Documents', icon: FileText, category: 'Knowledge' },
+  { to: '/codebase', label: 'GitHub', icon: Code2, category: 'Knowledge' },
+  { to: '/learning', label: 'Learning', icon: GraduationCap, category: 'Knowledge' },
+  { to: '/products', label: 'StockQuery', icon: Package, category: 'AI Agent' },
 ];
 
 export function Layout() {
@@ -48,7 +48,7 @@ export function Layout() {
                 <h1 className="text-xl font-bold bg-gradient-to-r from-primary-600 to-primary-500 bg-clip-text text-transparent">
                   KnowledgeRAG
                 </h1>
-                <p className="text-xs text-slate-500 -mt-1">AI-Powered Platform</p>
+                <p className="text-xs text-slate-500 -mt-1">AI Knowledge & Agent Platform</p>
               </div>
             </NavLink>
 

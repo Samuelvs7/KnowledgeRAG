@@ -131,6 +131,30 @@ export interface Repository {
   file_count: number;
   created_at: string;
   updated_at: string;
+  stats?: RepositoryStats;
+}
+
+export interface RepositoryStats {
+  file_count: number;
+  line_count: number;
+  function_count: number;
+  class_count: number;
+  language_breakdown: Record<string, number>;
+}
+
+export interface RepositoryIngestion {
+  id: string;
+  repository_id: string;
+  status: 'pending' | 'extracting' | 'parsing' | 'chunking' | 'embedding' | 'vectorizing' | 'ready' | 'failed';
+  progress: number;
+  stage_message: string | null;
+  file_count: number;
+  chunk_count: number;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at?: string | null;
 }
 
 export interface RepositoryFile {
@@ -143,6 +167,10 @@ export interface RepositoryFile {
   function_count: number;
   class_count: number;
   is_indexed: boolean;
+  content?: string | null;
+  content_stored?: boolean;
+  file_size?: number;
+  imports_json?: string[];
   created_at: string;
 }
 
@@ -259,6 +287,29 @@ export interface AIQuery {
   created_at: string;
 }
 
+export interface AISession {
+  id: string;
+  user_id: string;
+  module_type: string;
+  title: string;
+  scope_type?: 'all' | 'single_document' | 'collection';
+  scope_document_id?: string | null;
+  scope_collection_id?: string | null;
+  scope_document_title?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AIMessage {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  citations_json: Record<string, unknown>[] | null;
+  created_at: string;
+}
+
 export interface ContextChunk {
   id: string;
   content: string;
@@ -288,6 +339,8 @@ export interface AIInfrastructureStatus {
 }
 
 export interface AIDiagnostics {
+  intent?: string | null;
+  intentClassificationTimeMs?: number | null;
   embeddingGenerated: boolean;
   embeddingModel: string | null;
   embeddingDimensions: number | null;
@@ -314,3 +367,130 @@ export interface SearchResult<T> {
 export type SearchType = 'documents' | 'products' | 'codebase' | 'learning';
 
 export type IngestionStatus = 'pending' | 'parsing' | 'chunking' | 'embedding' | 'vectorizing' | 'ready' | 'failed';
+
+export interface QuizQuestion {
+  id: string;
+  question_text: string;
+  options: string[];
+  hint: string | null;
+  topic: string;
+  subject: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  order_index: number;
+  source_excerpt: string | null;
+}
+
+export interface Quiz {
+  id: string;
+  title: string;
+  subject: string;
+  topic: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  mode: string;
+  source: 'lernify_knowledge' | 'my_documents' | 'specific_document' | 'ai_generated' | 'mistakes';
+  question_count: number;
+  status: 'draft' | 'ready' | 'failed';
+  questions: QuizQuestion[];
+}
+
+export interface QuizAnswerResult {
+  is_correct: boolean;
+  correct_answer: string;
+  explanation: string;
+  mastery_score: number;
+  mastery_label: string;
+}
+
+export interface QuizAnswerRecord {
+  question_id: string;
+  selected_answer: string | null;
+  is_correct: boolean;
+  is_unknown: boolean;
+  correct_answer: string;
+  explanation: string;
+}
+
+export interface QuizResumeResult {
+  attempt_id: string;
+  quiz: Quiz;
+  answers: QuizAnswerRecord[];
+}
+
+export interface QuizTopicBreakdown {
+  subject: string;
+  topic: string;
+  accuracy: number;
+}
+
+export interface QuizCompleteResult {
+  attempt_id: string;
+  score: number;
+  accuracy: number;
+  correct_count: number;
+  incorrect_count: number;
+  unknown_count: number;
+  skipped_count: number;
+  time_spent_seconds: number;
+  classification: string;
+  topic_breakdown: QuizTopicBreakdown[];
+  learning_insight: string;
+}
+
+export interface TopicMastery {
+  subject: string;
+  topic: string;
+  mastery_score: number;
+  accuracy: number;
+  questions_attempted: number;
+  label: string;
+}
+
+export interface MistakeItem {
+  id: string;
+  question_id: string;
+  subject: string;
+  topic: string;
+  status: 'open' | 'practicing' | 'mastered';
+  review_count: number;
+  question_text: string | null;
+  options: string[] | null;
+  correct_answer: string | null;
+  explanation: string | null;
+  hint: string | null;
+}
+
+export interface RecentQuizItem {
+  attempt_id: string;
+  title: string;
+  question_count: number;
+  correct_count: number;
+  accuracy: number | null;
+  completed_at: string | null;
+}
+
+export interface ContinueLearningCard {
+  subject: string;
+  topic: string;
+  quiz_id: string | null;
+  attempt_id: string | null;
+  progress_percent: number | null;
+  reason: string;
+}
+
+export interface RecommendationItem {
+  label: string;
+  reason: string;
+  subject?: string;
+  topic?: string;
+}
+
+export interface QuizDashboard {
+  overall_mastery: number;
+  questions_answered: number;
+  accuracy: number;
+  topics_mastered: number;
+  continue_learning: ContinueLearningCard | null;
+  weak_areas: TopicMastery[];
+  recommendations: RecommendationItem[];
+  recent_quizzes: RecentQuizItem[];
+}

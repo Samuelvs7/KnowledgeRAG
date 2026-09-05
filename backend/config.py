@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     ollama_base_url: str = "http://localhost:11434"
+    github_token: str | None = None
+    max_repo_zip_bytes: int = 104_857_600  # 100 MB cap for GitHub archive downloads
     llm_provider: str = Field(
         default="gemini",
         validation_alias=AliasChoices("LLM_PROVIDER", "DEFAULT_PROVIDER")
@@ -40,11 +42,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GEMINI_EMBEDDING_MODEL", "EMBEDDING_MODEL"),
     )
     embedding_dimensions: int = 768
-    llm_model: str = "gemini-2.0-flash"
+    llm_model: str = "gemini-3.6-flash"
     supabase_timeout_seconds: float = 20.0
     storage_timeout_seconds: float = 120.0
     embedding_timeout_seconds: float = 45.0
-    llm_timeout_seconds: float = 120.0
+    llm_timeout_seconds: float = 300.0
     max_retry_attempts: int = 3
     embedding_concurrency: int = 5
     ingestion_concurrency: int = 2

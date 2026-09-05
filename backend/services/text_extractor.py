@@ -9,6 +9,11 @@ from typing import Any
 import docx
 from pypdf import PdfReader
 
+try:
+    from pptx import Presentation
+except ImportError:  # python-pptx is optional; PPTX just won't be supported without it
+    Presentation = None
+
 
 @dataclass(frozen=True)
 class ExtractedSegment:
@@ -24,6 +29,8 @@ def normalize_file_type(file_type: str, path: str | Path | None = None) -> str:
         return "pdf"
     if value in {"application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"} or suffix == ".docx":
         return "docx"
+    if value in {"application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"} or suffix == ".pptx":
+        return "pptx"
     if value in {"application/zip", "application/x-zip-compressed", "zip"} or suffix == ".zip":
         return "zip"
     return "text"
@@ -65,6 +72,18 @@ def extract_metadata(path: str | Path, file_type: str) -> dict[str, Any]:
             "modified": props.modified.isoformat() if props.modified else None,
             "section_count": len(document.sections),
         })
+    elif kind == "pptx" and Presentation is not None:
+        prs = Presentation(str(file_path))
+        props = prs.core_properties
+        metadata.update({
+            "title": props.title or file_path.stem,
+            "author": props.author or None,
+            "subject": props.subject or None,
+            "keywords": props.keywords or None,
+            "created": props.created.isoformat() if props.created else None,
+            "modified": props.modified.isoformat() if props.modified else None,
+            "page_count": len(prs.slides),
+        })
     return {key: value for key, value in metadata.items() if value is not None}
 
 
@@ -75,6 +94,8 @@ def iter_extracted_segments(path: str | Path, file_type: str) -> Iterator[Extrac
         yield from _iter_pdf(file_path)
     elif kind == "docx":
         yield from _iter_docx(file_path)
+    elif kind == "pptx":
+        yield from _iter_pptx(file_path)
     elif kind == "zip":
         yield from _iter_zip(file_path)
     else:
@@ -106,6 +127,35 @@ def _iter_docx(path: Path) -> Iterator[ExtractedSegment]:
             text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
             if text:
                 yield ExtractedSegment(text=text, section=f"Table {table_index}")
+
+
+def _iter_pptx(path: Path) -> Iterator[ExtractedSegment]:
+    if Presentation is None:
+        raise ValueError("python-pptx is not installed; cannot read .pptx files")
+    prs = Presentation(str(path))
+    for slide_number, slide in enumerate(prs.slides, start=1):
+        lines: list[str] = []
+        title = None
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            for para in shape.text_frame.paragraphs:
+                text = "".join(run.text for run in para.runs).strip() or para.text.strip()
+                if text:
+                    lines.append(text)
+            if title is None and getattr(shape, "text", "").strip():
+                title = shape.text.strip().splitlines()[0][:80]
+        # Include speaker notes — often the richest explanation.
+        try:
+            if slide.has_notes_slide:
+                notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+                if notes:
+                    lines.append(f"[Notes] {notes}")
+        except Exception:
+            pass
+        body = "\n".join(lines).strip()
+        if body:
+            yield ExtractedSegment(text=body, page=slide_number, section=title or f"Slide {slide_number}")
 
 
 def _iter_text(path: Path) -> Iterator[ExtractedSegment]:
@@ -160,7 +210,7 @@ def _iter_zip(path: Path) -> Iterator[ExtractedSegment]:
 
 def extract_text_from_file(file_bytes: bytes, file_type: str) -> str:
     """Compatibility helper for callers that still provide in-memory bytes."""
-    suffix = {"pdf": ".pdf", "docx": ".docx", "zip": ".zip"}.get(normalize_file_type(file_type), ".txt")
+    suffix = {"pdf": ".pdf", "docx": ".docx", "pptx": ".pptx", "zip": ".zip"}.get(normalize_file_type(file_type), ".txt")
     import tempfile
 
     path = ""

@@ -9,6 +9,8 @@ interface AIDiagnosticsPanelProps {
 export function AIDiagnosticsPanel({ diagnostics, isProcessing }: AIDiagnosticsPanelProps) {
   if (!diagnostics && !isProcessing) return null;
 
+  const isGeneralChat = diagnostics?.intent === 'general_chat' || (!diagnostics?.vectorSearchPerformed && !diagnostics?.embeddingGenerated);
+
   return (
     <div className="bg-slate-950 rounded-xl border border-slate-800 overflow-hidden">
       <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
@@ -17,63 +19,92 @@ export function AIDiagnosticsPanel({ diagnostics, isProcessing }: AIDiagnosticsP
           <span>AI Pipeline</span>
         </div>
         {diagnostics && (
-          <span className="text-xs text-slate-500">{diagnostics.totalTimeMs}ms</span>
+          <div className="flex items-center gap-2">
+            {diagnostics.intent && (
+              <span className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                {diagnostics.intent.replace('_', ' ')}
+              </span>
+            )}
+            <span className="text-xs text-slate-500">{diagnostics.totalTimeMs}ms</span>
+          </div>
         )}
       </div>
 
       {isProcessing && !diagnostics ? (
         <div className="p-6 flex flex-col items-center justify-center text-center">
           <Loader2 className="w-8 h-8 text-primary-500 animate-spin mb-3" />
-          <p className="text-sm text-slate-400">Processing query...</p>
+          <p className="text-sm text-slate-400">Classifying intent & processing...</p>
         </div>
       ) : diagnostics ? (
         <div className="divide-y divide-slate-800">
-          {/* Embedding Generation */}
+          {/* Step 1: Intent Detection */}
+          <div className="p-4 flex items-center gap-4">
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-blue-500/20 text-blue-400">
+              <CheckCircle className="w-4 h-4" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-sm text-slate-200">Intent Detection</span>
+                {diagnostics.intentClassificationTimeMs && (
+                  <span className="text-xs text-slate-500">{diagnostics.intentClassificationTimeMs}ms</span>
+                )}
+              </div>
+              <div className="text-xs text-slate-400">
+                Classified as <span className="text-blue-300 font-medium">{diagnostics.intent ? diagnostics.intent.replace('_', ' ') : 'General Conversation'}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Step 2: Embedding Generation */}
           <div className="p-4 flex items-center gap-4">
             <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
               diagnostics.embeddingGenerated ? 'bg-success-500/20 text-success-500' : 'bg-slate-800 text-slate-500'
             }`}>
-              {diagnostics.embeddingGenerated ? <CheckCircle className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+              {diagnostics.embeddingGenerated ? <CheckCircle className="w-4 h-4" /> : <span className="text-xs font-mono text-slate-500">⏭</span>}
             </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-slate-200">Embedding Generation</span>
-                {diagnostics.embeddingTimeMs && (
+                <span className={`text-sm ${diagnostics.embeddingGenerated ? 'text-slate-200' : 'text-slate-500'}`}>
+                  Embedding Generation
+                </span>
+                {diagnostics.embeddingTimeMs ? (
                   <span className="text-xs text-slate-500">{diagnostics.embeddingTimeMs}ms</span>
-                )}
+                ) : null}
               </div>
               <div className="text-xs text-slate-500">
-                {diagnostics.embeddingModel || 'text-embedding-3-small'} • {diagnostics.embeddingDimensions || 768} dimensions
+                {diagnostics.embeddingGenerated
+                  ? `${diagnostics.embeddingModel || 'text-embedding-3-small'} • ${diagnostics.embeddingDimensions || 768} dims`
+                  : 'Skipped (Direct LLM Chat)'}
               </div>
             </div>
           </div>
 
-          {/* Vector Search */}
+          {/* Step 3: Vector Search */}
           <div className="p-4 flex items-center gap-4">
             <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
               diagnostics.vectorSearchPerformed ? 'bg-success-500/20 text-success-500' : 'bg-slate-800 text-slate-500'
             }`}>
-              {diagnostics.vectorSearchPerformed ? <CheckCircle className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+              {diagnostics.vectorSearchPerformed ? <CheckCircle className="w-4 h-4" /> : <span className="text-xs font-mono text-slate-500">⏭</span>}
             </div>
             <div className="flex-1 min-w-0">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-slate-200">Vector Search</span>
-                {diagnostics.vectorSearchTimeMs && (
+                <span className={`text-sm ${diagnostics.vectorSearchPerformed ? 'text-slate-200' : 'text-slate-500'}`}>
+                  Vector Search & Retrieval
+                </span>
+                {diagnostics.vectorSearchTimeMs ? (
                   <span className="text-xs text-slate-500">{diagnostics.vectorSearchTimeMs}ms</span>
-                )}
+                ) : null}
               </div>
-              {diagnostics.vectorSearchPerformed ? (
-                <div className="text-xs text-slate-500">
-                  Retrieved {diagnostics.vectorSearchResults} chunks from pgvector
-                </div>
-              ) : (
-                <div className="text-xs text-amber-500">No vector search performed</div>
-              )}
+              <div className="text-xs text-slate-500">
+                {diagnostics.vectorSearchPerformed
+                  ? `Retrieved ${diagnostics.vectorSearchResults} chunks from pgvector`
+                  : 'Skipped (Direct LLM Chat)'}
+              </div>
             </div>
           </div>
 
-          {/* Reranking */}
-          {diagnostics.rerankerUsed && (
+          {/* Step 4: Reranking (if performed or skipped) */}
+          {!isGeneralChat && diagnostics.rerankerUsed && (
             <div className="p-4 flex items-center gap-4">
               <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-success-500/20 text-success-500">
                 <CheckCircle className="w-4 h-4" />
@@ -92,23 +123,23 @@ export function AIDiagnosticsPanel({ diagnostics, isProcessing }: AIDiagnosticsP
             </div>
           )}
 
-          {/* LLM Response */}
-          {diagnostics.llmTimeMs && (
-            <div className="p-4 flex items-center gap-4">
-              <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-primary-500/20 text-primary-500">
-                <RefreshCw className="w-4 h-4" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm text-slate-200">LLM Generation</span>
+          {/* Step 5: LLM Generation */}
+          <div className="p-4 flex items-center gap-4">
+            <div className="w-8 h-8 rounded-lg flex items-center justify-center bg-primary-500/20 text-primary-500">
+              <RefreshCw className="w-4 h-4" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-sm text-slate-200">LLM Generation</span>
+                {diagnostics.llmTimeMs ? (
                   <span className="text-xs text-slate-500">{diagnostics.llmTimeMs}ms</span>
-                </div>
-                <div className="text-xs text-slate-500">
-                  {diagnostics.llmPromptTokens || 0} prompt + {diagnostics.llmCompletionTokens || 0} completion tokens
-                </div>
+                ) : null}
+              </div>
+              <div className="text-xs text-slate-500">
+                {diagnostics.llmPromptTokens || 0} prompt + {diagnostics.llmCompletionTokens || 0} completion tokens
               </div>
             </div>
-          )}
+          </div>
         </div>
       ) : null}
     </div>

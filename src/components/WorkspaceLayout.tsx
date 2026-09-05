@@ -28,6 +28,7 @@ interface WorkspaceLayoutProps {
   icon: typeof FileText;
   accentColor: string;
   sidebarItems: SidebarItem[];
+  bottomSidebarItems?: SidebarItem[];
 }
 
 export interface SidebarItem {
@@ -47,6 +48,7 @@ export function WorkspaceLayout({
   icon: Icon,
   accentColor,
   sidebarItems,
+  bottomSidebarItems,
 }: WorkspaceLayoutProps) {
   const { user, profile, signOut, updateProfile } = useAuth();
   const location = useLocation();
@@ -55,11 +57,14 @@ export function WorkspaceLayout({
   const [editName, setEditName] = useState('');
   const [updatingProfile, setUpdatingProfile] = useState(false);
 
-  const modules = [
+  const knowledgeModules = [
     { to: '/documents', label: 'Documents', icon: FileText, color: 'bg-blue-500' },
-    { to: '/products', label: 'Products', icon: Package, color: 'bg-emerald-500' },
-    { to: '/codebase', label: 'Codebase', icon: Code2, color: 'bg-violet-500' },
+    { to: '/codebase', label: 'GitHub', icon: Code2, color: 'bg-violet-500' },
     { to: '/learning', label: 'Learning', icon: GraduationCap, color: 'bg-orange-500' },
+  ];
+
+  const agentModules = [
+    { to: '/products', label: 'StockQuery', icon: Package, color: 'bg-emerald-500' },
   ];
 
   const handleUpdateProfile = async () => {
@@ -75,18 +80,21 @@ export function WorkspaceLayout({
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 flex">
+    <div className="h-screen bg-slate-900 flex overflow-hidden">
       {/* Left Sidebar - Module Navigation */}
       <div className="w-16 bg-slate-950 border-r border-slate-800 flex flex-col items-center py-4 gap-2">
-        <Link to="/" className="mb-4">
+        <Link to="/" className="mb-2">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary-500 to-primary-600 flex items-center justify-center hover:shadow-lg hover:shadow-primary-500/25 transition-all">
             <Brain className="w-5 h-5 text-white" />
           </div>
         </Link>
 
-        <div className="w-8 h-px bg-slate-800 mb-2" />
+        {/* KNOWLEDGE Section Header */}
+        <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wider my-0.5 text-center">
+          KNL
+        </div>
 
-        {modules.map((mod) => {
+        {knowledgeModules.map((mod) => {
           const isActive = location.pathname.startsWith(mod.to);
           return (
             <Link
@@ -97,7 +105,32 @@ export function WorkspaceLayout({
                   ? `${mod.color} text-white shadow-lg`
                   : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
               }`}
-              title={mod.label}
+              title={`Knowledge > ${mod.label}`}
+            >
+              <mod.icon className="w-5 h-5" />
+            </Link>
+          );
+        })}
+
+        <div className="w-8 h-px bg-slate-800 my-1" />
+
+        {/* AI AGENTS Section Header */}
+        <div className="text-[9px] font-bold text-emerald-500/80 uppercase tracking-wider my-0.5 text-center">
+          AGT
+        </div>
+
+        {agentModules.map((mod) => {
+          const isActive = location.pathname.startsWith(mod.to);
+          return (
+            <Link
+              key={mod.to}
+              to={mod.to}
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all ${
+                isActive
+                  ? `${mod.color} text-white shadow-lg`
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
+              }`}
+              title={`AI Agent > ${mod.label}`}
             >
               <mod.icon className="w-5 h-5" />
             </Link>
@@ -154,11 +187,16 @@ export function WorkspaceLayout({
         {/* Module Header */}
         <div className="p-4 border-b border-slate-800">
           <div className="flex items-center gap-3">
-            <div className={`w-10 h-10 rounded-xl ${accentColor} flex items-center justify-center`}>
+            <div className={`w-10 h-10 rounded-xl ${accentColor} flex items-center justify-center shrink-0`}>
               <Icon className="w-5 h-5 text-white" />
             </div>
             <div>
-              <h1 className="font-semibold text-white">{title}</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="font-semibold text-white">{title}</h1>
+                <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded bg-slate-800 text-slate-400 border border-slate-700">
+                  {location.pathname.startsWith('/products') ? 'AI AGENT' : 'KNOWLEDGE'}
+                </span>
+              </div>
               <p className="text-xs text-slate-500">{subtitle}</p>
             </div>
           </div>
@@ -197,6 +235,31 @@ export function WorkspaceLayout({
             </button>
           ))}
         </div>
+
+        {/* Bottom Sidebar Items */}
+        {bottomSidebarItems && bottomSidebarItems.length > 0 && (
+          <div className="p-2 border-t border-slate-800 bg-slate-950/40">
+            {bottomSidebarItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={item.onClick}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all ${
+                  item.active
+                    ? 'bg-blue-600 text-white font-medium shadow-md'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+              >
+                <item.icon className="w-4 h-4 flex-shrink-0 text-blue-400" />
+                <span className="flex-1 text-left font-medium">{item.label}</span>
+                {item.badge !== undefined && (
+                  <span className="px-2 py-0.5 text-xs bg-slate-700 text-slate-300 rounded">
+                    {item.badge}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Main Content */}

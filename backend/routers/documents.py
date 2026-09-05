@@ -79,10 +79,36 @@ async def query_documents(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
-    
+    doc_title = None
+    if document_id:
+        doc = await asyncio.to_thread(_get_document_for_user, document_id, user.id)
+        if doc:
+            doc_title = doc.get("title")
+
+    scope_mode = (req.scope.mode if req.scope else "all").lower()
+    scope_type = "single_document" if scope_mode in ("document", "single_document") else ("collection" if scope_mode == "collection" else "all")
+
     session_id = getattr(req, 'session_id', None)
     if not session_id:
-        session_id = await asyncio.to_thread(MemoryService.create_session, user.id, "document_rag", f"Query: {req.query[:30]}...")
+        session_id = await asyncio.to_thread(
+            MemoryService.create_session,
+            user.id,
+            "document_rag",
+            f"Query: {req.query[:30]}...",
+            scope_type=scope_type,
+            scope_document_id=document_id,
+            scope_collection_id=collection_id,
+            scope_document_title=doc_title,
+        )
+    else:
+        await asyncio.to_thread(
+            MemoryService.update_session_scope,
+            session_id,
+            scope_type,
+            document_id,
+            collection_id,
+            doc_title,
+        )
         
     await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
     response_dict = await AgentRegistry.execute("document_rag", req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text, session_id=session_id)
@@ -102,9 +128,36 @@ async def stream_query_documents(
     user: AuthenticatedUser = Depends(get_current_user),
 ):
     document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
+    doc_title = None
+    if document_id:
+        doc = await asyncio.to_thread(_get_document_for_user, document_id, user.id)
+        if doc:
+            doc_title = doc.get("title")
+
+    scope_mode = (req.scope.mode if req.scope else "all").lower()
+    scope_type = "single_document" if scope_mode in ("document", "single_document") else ("collection" if scope_mode == "collection" else "all")
+
     session_id = getattr(req, 'session_id', None)
     if not session_id:
-        session_id = await asyncio.to_thread(MemoryService.create_session, user.id, "document_rag", f"Query: {req.query[:30]}...")
+        session_id = await asyncio.to_thread(
+            MemoryService.create_session,
+            user.id,
+            "document_rag",
+            f"Query: {req.query[:30]}...",
+            scope_type=scope_type,
+            scope_document_id=document_id,
+            scope_collection_id=collection_id,
+            scope_document_title=doc_title,
+        )
+    else:
+        await asyncio.to_thread(
+            MemoryService.update_session_scope,
+            session_id,
+            scope_type,
+            document_id,
+            collection_id,
+            doc_title,
+        )
         
     await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
 

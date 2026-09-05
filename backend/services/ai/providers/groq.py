@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from collections.abc import AsyncIterator
 
 try:
@@ -11,7 +12,7 @@ except ImportError:
 
 from config import settings
 from services.ai.providers.base import BaseProvider, LLMResult
-from services.retry import with_retry
+from services.retry import is_transient_error, with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -74,26 +75,34 @@ class GroqProvider(BaseProvider):
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
 
-        # No retry logic for streaming in with_retry usually, just yield
-        try:
-            stream = await self.client.chat.completions.create(
-                messages=messages,
-                model=settings.llm_model,
-                temperature=0.2,
-                stream=True,
-                # Timeout added specifically per prompt's "production-grade error handling"
-                timeout=settings.llm_timeout_seconds
-            )
-            async for chunk in stream:
-                content = chunk.choices[0].delta.content if chunk.choices else None
-                if content:
-                    yield content
-        except groq.AuthenticationError as e:
-            logger.error("[ERROR] Groq authentication failed during stream")
-            raise ValueError("Groq authentication failed") from e
-        except Exception as e:
-            logger.exception("[ERROR] Error in Groq stream")
-            raise RuntimeError("LLM stream failed") from e
+        attempts = max(1, settings.max_retry_attempts)
+        for attempt in range(1, attempts + 1):
+            produced = False
+            try:
+                stream = await self.client.chat.completions.create(
+                    messages=messages,
+                    model=settings.llm_model,
+                    temperature=0.2,
+                    stream=True,
+                    timeout=settings.llm_timeout_seconds,
+                )
+                async for chunk in stream:
+                    content = chunk.choices[0].delta.content if chunk.choices else None
+                    if content:
+                        produced = True
+                        yield content
+                return
+            except groq.AuthenticationError as e:
+                logger.error("[ERROR] Groq authentication failed during stream")
+                raise ValueError("Groq authentication failed") from e
+            except Exception as e:
+                # Only retry when nothing was emitted yet (avoid duplicating output).
+                if produced or attempt >= attempts or not is_transient_error(e):
+                    logger.exception("[ERROR] Error in Groq stream")
+                    raise RuntimeError("LLM stream failed") from e
+                delay = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+                logger.warning("[GROQ] stream attempt %d/%d failed (%s); retrying in %.1fs", attempt, attempts, e, delay)
+                await asyncio.sleep(delay)
 
     def _result_from_response(self, response) -> LLMResult:
         content = response.choices[0].message.content or ""
