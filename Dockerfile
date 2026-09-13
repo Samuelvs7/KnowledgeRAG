@@ -5,7 +5,7 @@ COPY package*.json ./
 RUN npm ci
 COPY . .
 
-# Grab Railway's injected environment variables during the build stage
+# The host (Render/Railway) injects these as build args from the service's env vars
 ARG VITE_SUPABASE_URL
 ARG VITE_SUPABASE_ANON_KEY
 
@@ -35,6 +35,6 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Run FastAPI with Gunicorn (4 workers) binding to the $PORT env var
-# Shell form is required so $PORT is expanded at runtime (Railway injects PORT dynamically)
+# Shell form is required so $PORT is expanded at runtime (the host injects PORT dynamically)
 CMD gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT
 
