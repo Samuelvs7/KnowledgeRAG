@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from auth import AuthenticatedUser, get_current_user
 from config import settings
 from database import supabase
-from models.schemas import Diagnostics, DocumentIngestRequest, QueryRequest
+from models.schemas import CompleteQueryRequest, Diagnostics, DocumentIngestRequest, PreparedPrompt, QueryRequest
 from services.chunker import DocumentChunk, iter_document_chunks
 from services.text_extractor import extract_metadata, iter_extracted_segments, normalize_file_type
 from services.vector_store import finalize_document_chunks, insert_staging_chunks
@@ -190,6 +190,76 @@ async def stream_query_documents(
             yield _sse("error", {"message": str(exc)})
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.post("/query/prepare", response_model=PreparedPrompt)
+async def prepare_query_documents(
+    req: QueryRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Run retrieval and build the grounded prompt WITHOUT calling an LLM provider,
+    so the caller (e.g. the browser talking to the user's own local Ollama) can generate the answer itself."""
+    if not AgentRegistry.is_enabled("document_rag"):
+        raise HTTPException(status_code=503, detail="document_rag agent is disabled")
+
+    document_id, collection_id, scope_text = await _resolve_scope(req, user.id)
+    doc_title = None
+    if document_id:
+        doc = await asyncio.to_thread(_get_document_for_user, document_id, user.id)
+        if doc:
+            doc_title = doc.get("title")
+
+    scope_mode = (req.scope.mode if req.scope else "all").lower()
+    scope_type = "single_document" if scope_mode in ("document", "single_document") else ("collection" if scope_mode == "collection" else "all")
+
+    session_id = getattr(req, 'session_id', None)
+    if not session_id:
+        session_id = await asyncio.to_thread(
+            MemoryService.create_session,
+            user.id,
+            "document_rag",
+            f"Query: {req.query[:30]}...",
+            scope_type=scope_type,
+            scope_document_id=document_id,
+            scope_collection_id=collection_id,
+            scope_document_title=doc_title,
+        )
+    else:
+        await asyncio.to_thread(
+            MemoryService.update_session_scope,
+            session_id,
+            scope_type,
+            document_id,
+            collection_id,
+            doc_title,
+        )
+
+    await asyncio.to_thread(MemoryService.add_message, session_id, "user", req.query)
+
+    agent = AgentRegistry.get_agent("document_rag")
+    result = await agent.prepare(req.query, user.id, document_id=document_id, collection_id=collection_id, scope_text=scope_text, session_id=session_id)
+
+    return PreparedPrompt(
+        prompt=result["prompt"],
+        system_instruction=result["system_instruction"],
+        diagnostics=result["diagnostics"],
+        context_chunks=result["context_chunks"],
+        session_id=session_id,
+    )
+
+
+@router.post("/query/complete")
+async def complete_query_documents(
+    req: CompleteQueryRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Persist an answer that was generated client-side (local Ollama) — mirrors what
+    /query/stream does at the end of the SSE stream."""
+    diagnostics = req.diagnostics or Diagnostics()
+    citations = [c.model_dump() for c in diagnostics.contextChunks]
+    await asyncio.to_thread(MemoryService.add_message, req.session_id, "assistant", req.answer, citations=citations)
+    await asyncio.to_thread(_log_document_query, user.id, req.query.strip(), req.answer, diagnostics)
+    return {"status": "ok"}
 
 
 async def recover_pending_ingestions() -> None:

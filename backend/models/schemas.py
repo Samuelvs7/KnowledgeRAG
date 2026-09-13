@@ -50,6 +50,19 @@ class QueryResponse(BaseModel):
     diagnostics: Diagnostics
     session_id: Optional[str] = None
 
+class PreparedPrompt(BaseModel):
+    prompt: str
+    system_instruction: str
+    diagnostics: Diagnostics
+    context_chunks: List[ContentChunk] = []
+    session_id: Optional[str] = None
+
+class CompleteQueryRequest(BaseModel):
+    session_id: str
+    query: str
+    answer: str
+    diagnostics: Optional[Diagnostics] = None
+
 class AgentInfo(BaseModel):
     id: str
     name: str

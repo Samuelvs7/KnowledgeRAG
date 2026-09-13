@@ -188,7 +188,18 @@ class DocumentRAGAgent(BaseAgent):
 
     async def stream(self, query: str, user_id: str, **kwargs):
         prompt, context_chunks, diagnostics = await self._prepare(query, user_id, **kwargs)
-        
+
         # Return the diagnostics immediately and the generator
         gen = self.provider.stream_text(prompt, system_instruction=self._rag_system_instruction())
         return diagnostics, gen, context_chunks
+
+    async def prepare(self, query: str, user_id: str, **kwargs) -> dict[str, Any]:
+        """Build the retrieval-grounded prompt without calling an LLM provider,
+        so a caller can generate the answer elsewhere (e.g. the user's own local Ollama)."""
+        prompt, context_chunks, diagnostics = await self._prepare(query, user_id, **kwargs)
+        return {
+            "prompt": prompt,
+            "system_instruction": self._rag_system_instruction(),
+            "diagnostics": diagnostics,
+            "context_chunks": [c.model_dump() for c in context_chunks],
+        }

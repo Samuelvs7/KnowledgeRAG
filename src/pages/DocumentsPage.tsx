@@ -16,11 +16,13 @@ import type {
 } from '../types';
 import { WorkspaceOverviewDrawer } from '../components/WorkspaceOverviewDrawer';
 import { ChatHistorySidebar } from '../components/chat/ChatHistorySidebar';
+import { checkOllamaAvailable, listOllamaModels, ollamaInstallMessage, streamOllamaChat, type OllamaModel } from '../lib/ollama';
 import {
   AlertTriangle,
   BarChart3,
   CheckCircle,
   Clock,
+  Cpu,
   FileSearch,
   FileText,
   FolderOpen,
@@ -64,6 +66,8 @@ interface BackendHealth {
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 const SESSIONS_STORAGE_KEY = 'knowledgerag_current_session';
 const PINNED_STORAGE_KEY = 'knowledgerag_pinned_sessions';
+const LOCAL_OLLAMA_ENABLED_KEY = 'knowledgerag_local_ollama_enabled';
+const LOCAL_OLLAMA_MODEL_KEY = 'knowledgerag_local_ollama_model';
 
 const ACCEPTED_FILE_TYPES = [
   '.pdf',
@@ -129,9 +133,47 @@ export function DocumentsPage() {
     } catch { return new Set<string>(); }
   });
 
+  // === Local Ollama State ===
+  const [useLocalOllama, setUseLocalOllama] = useState(
+    () => localStorage.getItem(LOCAL_OLLAMA_ENABLED_KEY) === 'true'
+  );
+  const [ollamaModel, setOllamaModel] = useState(
+    () => localStorage.getItem(LOCAL_OLLAMA_MODEL_KEY) || ''
+  );
+  const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
+  const [ollamaStatus, setOllamaStatus] = useState<'unknown' | 'checking' | 'available' | 'unavailable'>('unknown');
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem(LOCAL_OLLAMA_ENABLED_KEY, String(useLocalOllama));
+  }, [useLocalOllama]);
+
+  useEffect(() => {
+    if (ollamaModel) localStorage.setItem(LOCAL_OLLAMA_MODEL_KEY, ollamaModel);
+  }, [ollamaModel]);
+
+  const refreshOllamaStatus = async () => {
+    setOllamaStatus('checking');
+    const available = await checkOllamaAvailable();
+    if (!available) {
+      setOllamaStatus('unavailable');
+      setOllamaModels([]);
+      return;
+    }
+    setOllamaStatus('available');
+    const models = await listOllamaModels();
+    setOllamaModels(models);
+    if (!ollamaModel && models.length > 0) {
+      setOllamaModel(models[0].name);
+    }
+  };
+
+  useEffect(() => {
+    if (useLocalOllama) void refreshOllamaStatus();
+  }, [useLocalOllama]);
 
   useEffect(() => {
     if (user) {
@@ -764,6 +806,11 @@ export function DocumentsPage() {
 
     const startTime = Date.now();
 
+    if (useLocalOllama) {
+      await handleLocalOllamaQuery(userMessage, assistantMessageId, startTime);
+      return;
+    }
+
     try {
       queryAbortRef.current?.abort();
       const controller = new AbortController();
@@ -881,6 +928,103 @@ export function DocumentsPage() {
       )));
     } finally {
       queryAbortRef.current = null;
+      setProcessing(false);
+    }
+  };
+
+  const handleLocalOllamaQuery = async (userMessage: Message, assistantMessageId: string, startTime: number) => {
+    const updateAssistantMessage = (content: string, citations?: ContextChunk[]) => {
+      setMessages(prev => prev.map(message => (
+        message.id === assistantMessageId
+          ? { ...message, content, citations: citations ?? message.citations }
+          : message
+      )));
+    };
+
+    try {
+      const available = await checkOllamaAvailable();
+      if (!available) {
+        setOllamaStatus('unavailable');
+        updateAssistantMessage(ollamaInstallMessage());
+        return;
+      }
+      setOllamaStatus('available');
+
+      let model = ollamaModel;
+      if (!model) {
+        const models = await listOllamaModels();
+        setOllamaModels(models);
+        if (models.length === 0) {
+          updateAssistantMessage(
+            'Ollama is running, but no models are pulled yet. Run `ollama pull llama3.2` (or any model you like) in a terminal, then try again.'
+          );
+          return;
+        }
+        model = models[0].name;
+        setOllamaModel(model);
+      }
+
+      const prepResponse = await fetch(`${API_BASE_URL}/api/documents/query/prepare`, {
+        method: 'POST',
+        headers: authorizedJsonHeaders(),
+        body: JSON.stringify({
+          query: userMessage.content,
+          session_id: currentSessionId || undefined,
+          scope: {
+            mode: aiMode,
+            document_id: aiMode === 'document' ? modeDocumentId || selectedDocument?.id : null,
+            collection_id: aiMode === 'collection' ? modeCollectionId || selectedCollection?.id : null,
+          },
+        }),
+      });
+
+      if (!prepResponse.ok) {
+        const data = await prepResponse.json().catch(() => ({}));
+        throw new Error(data.detail || 'Could not prepare the query.');
+      }
+
+      const prepared = await prepResponse.json();
+      if (prepared.session_id && !currentSessionId) {
+        setCurrentSessionId(prepared.session_id as string);
+      }
+      const preparedDiagnostics = prepared.diagnostics as AIDiagnostics;
+      const citations = preparedDiagnostics.contextChunks || [];
+      setDiagnostics(preparedDiagnostics);
+      updateAssistantMessage('', citations);
+
+      let assistantContent = '';
+      const answer = await streamOllamaChat(model, prepared.system_instruction, prepared.prompt, delta => {
+        assistantContent += delta;
+        updateAssistantMessage(assistantContent, citations);
+      });
+
+      const finalAnswer = (answer || assistantContent).trim();
+      const llmTimeMs = Date.now() - startTime;
+      const finalDiagnostics: AIDiagnostics = {
+        ...preparedDiagnostics,
+        llmTimeMs,
+        totalTimeMs: (preparedDiagnostics.totalTimeMs || 0) + llmTimeMs,
+      };
+      setDiagnostics(finalDiagnostics);
+      updateAssistantMessage(finalAnswer, citations);
+
+      await fetch(`${API_BASE_URL}/api/documents/query/complete`, {
+        method: 'POST',
+        headers: authorizedJsonHeaders(),
+        body: JSON.stringify({
+          session_id: prepared.session_id,
+          query: userMessage.content,
+          answer: finalAnswer,
+          diagnostics: finalDiagnostics,
+        }),
+      });
+
+      void fetchData();
+      void fetchSessions();
+    } catch (err) {
+      console.error('Local Ollama query error:', err);
+      updateAssistantMessage(ollamaInstallMessage());
+    } finally {
       setProcessing(false);
     }
   };
@@ -1195,6 +1339,52 @@ export function DocumentsPage() {
         </div>
 
         <form onSubmit={handleQuerySubmit} className="border-t border-slate-800 bg-slate-950 p-4">
+          <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => setUseLocalOllama(prev => !prev)}
+              className={`flex items-center gap-1.5 rounded-full border px-3 py-1 transition-colors ${
+                useLocalOllama
+                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-300'
+                  : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'
+              }`}
+              title="When on, answers are generated by Ollama running on this device instead of the cloud LLM"
+            >
+              <Cpu className="h-3.5 w-3.5" />
+              Local Ollama
+            </button>
+            {useLocalOllama && (
+              <>
+                {ollamaStatus === 'checking' && (
+                  <span className="flex items-center gap-1 text-slate-500">
+                    <Loader2 className="h-3 w-3 animate-spin" /> Checking for Ollama...
+                  </span>
+                )}
+                {ollamaStatus === 'unavailable' && (
+                  <span className="text-amber-400">Ollama not reachable on this device</span>
+                )}
+                {ollamaStatus === 'available' && ollamaModels.length > 0 && (
+                  <select
+                    value={ollamaModel}
+                    onChange={event => setOllamaModel(event.target.value)}
+                    className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-slate-300 focus:outline-none"
+                  >
+                    {ollamaModels.map(model => (
+                      <option key={model.name} value={model.name}>{model.name}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void refreshOllamaStatus()}
+                  className="text-slate-500 hover:text-slate-300"
+                  title="Re-check for Ollama"
+                >
+                  <Loader2 className={`h-3.5 w-3.5 ${ollamaStatus === 'checking' ? 'animate-spin' : ''}`} />
+                </button>
+              </>
+            )}
+          </div>
           <div className="mx-auto flex max-w-3xl gap-3">
             <input
               value={query}
