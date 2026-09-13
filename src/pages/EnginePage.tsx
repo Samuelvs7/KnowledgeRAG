@@ -12,7 +12,6 @@ import {
   BarChart3,
   Layers,
   FileText,
-  Package,
   Code2,
   GraduationCap,
   Search,
@@ -88,7 +87,6 @@ export function EnginePage() {
   // TODO: Replace with real database counts in Phase 3+
   const stats: Record<string, ModuleStat> = {
     documents: { primary: 1247, secondary: 1247, queries: 89, primaryLabel: 'Chunks', secondaryLabel: 'Embeddings' },
-    products: { primary: 8, secondary: 342, queries: 56, primaryLabel: 'Indexed', secondaryLabel: 'Recommendations' },
     codebase: { primary: 24, secondary: 156, queries: 23, primaryLabel: 'Files', secondaryLabel: 'Functions' },
     learning: { primary: 12, secondary: 456, queries: 45, primaryLabel: 'Materials', secondaryLabel: 'Chunks' },
   };
@@ -125,9 +123,6 @@ export function EnginePage() {
 
         <a href="/documents" className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition-all">
           <FileText className="w-5 h-5" />
-        </a>
-        <a href="/products" className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition-all">
-          <Package className="w-5 h-5" />
         </a>
         <a href="/codebase" className="w-10 h-10 rounded-xl flex items-center justify-center text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition-all">
           <Code2 className="w-5 h-5" />
@@ -213,7 +208,6 @@ export function EnginePage() {
             <div className="divide-y divide-slate-700">
               {[
                 { name: 'Documents', key: 'documents', icon: FileText, color: 'text-blue-400' },
-                { name: 'Products', key: 'products', icon: Package, color: 'text-emerald-400' },
                 { name: 'Codebase', key: 'codebase', icon: Code2, color: 'text-violet-400' },
                 { name: 'Learning', key: 'learning', icon: GraduationCap, color: 'text-orange-400' },
               ].map(module => {
@@ -267,12 +261,10 @@ export function EnginePage() {
                   <div key={query.id} className="px-5 py-3 flex items-center gap-4">
                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
                       query.query_type === 'document' ? 'bg-blue-500/20 text-blue-400' :
-                      query.query_type === 'product' ? 'bg-emerald-500/20 text-emerald-400' :
                       query.query_type === 'codebase' ? 'bg-violet-500/20 text-violet-400' :
                       'bg-orange-500/20 text-orange-400'
                     }`}>
                       {query.query_type === 'document' ? <FileText className="w-4 h-4" /> :
-                       query.query_type === 'product' ? <Package className="w-4 h-4" /> :
                        query.query_type === 'codebase' ? <Code2 className="w-4 h-4" /> :
                        <GraduationCap className="w-4 h-4" />}
                     </div>

@@ -14,7 +14,7 @@ from logging_config import configure_logging
 
 configure_logging()
 
-from routers import documents, products, sessions, search, platform, codebase, quiz, learning
+from routers import documents, sessions, search, platform, codebase, quiz, learning
 from middleware import RequestIdMiddleware, MetricsMiddleware
 from services.plugin_manager import PluginManager
 
@@ -47,7 +47,6 @@ app.add_middleware(
 )
 
 app.include_router(documents.router)
-app.include_router(products.router)
 app.include_router(sessions.router)
 app.include_router(search.router)
 app.include_router(platform.router)

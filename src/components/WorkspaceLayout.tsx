@@ -4,7 +4,6 @@ import { useAuth } from '../hooks/useAuth';
 import {
   Brain,
   FileText,
-  Package,
   Code2,
   GraduationCap,
   Cpu,
@@ -63,10 +62,6 @@ export function WorkspaceLayout({
     { to: '/learning', label: 'Learning', icon: GraduationCap, color: 'bg-orange-500' },
   ];
 
-  const agentModules = [
-    { to: '/products', label: 'StockQuery', icon: Package, color: 'bg-emerald-500' },
-  ];
-
   const handleUpdateProfile = async () => {
     setUpdatingProfile(true);
     try {
@@ -106,31 +101,6 @@ export function WorkspaceLayout({
                   : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
               }`}
               title={`Knowledge > ${mod.label}`}
-            >
-              <mod.icon className="w-5 h-5" />
-            </Link>
-          );
-        })}
-
-        <div className="w-8 h-px bg-slate-800 my-1" />
-
-        {/* AI AGENTS Section Header */}
-        <div className="text-[9px] font-bold text-emerald-500/80 uppercase tracking-wider my-0.5 text-center">
-          AGT
-        </div>
-
-        {agentModules.map((mod) => {
-          const isActive = location.pathname.startsWith(mod.to);
-          return (
-            <Link
-              key={mod.to}
-              to={mod.to}
-              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all ${
-                isActive
-                  ? `${mod.color} text-white shadow-lg`
-                  : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
-              }`}
-              title={`AI Agent > ${mod.label}`}
             >
               <mod.icon className="w-5 h-5" />
             </Link>
@@ -194,7 +164,7 @@ export function WorkspaceLayout({
               <div className="flex items-center gap-2">
                 <h1 className="font-semibold text-white">{title}</h1>
                 <span className="px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider rounded bg-slate-800 text-slate-400 border border-slate-700">
-                  {location.pathname.startsWith('/products') ? 'AI AGENT' : 'KNOWLEDGE'}
+                  KNOWLEDGE
                 </span>
               </div>
               <p className="text-xs text-slate-500">{subtitle}</p>
@@ -423,7 +393,6 @@ export function WorkspaceLayout({
                     <div className="p-5 grid gap-3">
                       {[
                         { title: 'Document RAG', desc: 'Query unstructured documents' },
-                        { title: 'Product Search', desc: 'Inventory agent & analytics' },
                         { title: 'Codebase Support', desc: 'Symbol and logic querying' },
                         { title: 'Learning Suite', desc: 'Flashcards and summaries' },
                       ].map((feature) => (

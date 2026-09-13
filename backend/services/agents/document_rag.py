@@ -131,7 +131,7 @@ class DocumentRAGAgent(BaseAgent):
             prompt = (
                 f"User Message: {query}\n\n"
                 "Provide a helpful, friendly, and natural conversational response. "
-                "Briefly mention key platform capabilities (Inventory tracking, product search, warehouse info, purchase orders, forecasts, analytics)."
+                "Briefly mention key platform capabilities (document search with citations, codebase understanding, and guided learning)."
             )
 
         if history:

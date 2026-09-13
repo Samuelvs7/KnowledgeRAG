@@ -63,66 +63,6 @@ export interface DocumentIngestion {
   updated_at?: string | null;
 }
 
-export interface Product {
-  id: string;
-  name: string;
-  description: string | null;
-  category: string;
-  price: number;
-  image_url: string | null;
-  specifications: Record<string, unknown>;
-  popularity_score: number;
-  stock_quantity: number;
-  reorder_level: number;
-  supplier_id: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface InventoryAlert {
-  id: string;
-  product_id: string;
-  alert_type: 'low_stock' | 'out_of_stock' | 'reorder_recommended';
-  threshold_value: number | null;
-  current_value: number | null;
-  message: string | null;
-  acknowledged: boolean;
-  created_at: string;
-  resolved_at: string | null;
-}
-
-export interface PurchaseOrder {
-  id: string;
-  user_id: string;
-  order_number: string;
-  supplier: string | null;
-  status: 'pending' | 'approved' | 'ordered' | 'received' | 'cancelled';
-  total_value: number | null;
-  order_date: string | null;
-  expected_delivery: string | null;
-  notes: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface OrderItem {
-  id: string;
-  order_id: string;
-  product_id: string | null;
-  quantity: number;
-  unit_price: number | null;
-  created_at: string;
-}
-
-export interface Supplier {
-  id: string;
-  name: string;
-  contact_email: string | null;
-  contact_phone: string | null;
-  address: string | null;
-  created_at: string;
-}
-
 export interface Repository {
   id: string;
   user_id: string;
@@ -364,7 +304,7 @@ export interface SearchResult<T> {
   similarity: number;
 }
 
-export type SearchType = 'documents' | 'products' | 'codebase' | 'learning';
+export type SearchType = 'documents' | 'codebase' | 'learning';
 
 export type IngestionStatus = 'pending' | 'parsing' | 'chunking' | 'embedding' | 'vectorizing' | 'ready' | 'failed';
 
